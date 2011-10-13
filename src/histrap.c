@@ -2,7 +2,7 @@
 /*	$OpenBSD: trap.c,v 1.23 2010/05/19 17:36:08 jasper Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -22,11 +22,11 @@
  */
 
 #include "sh.h"
-#if HAVE_PERSISTENT_HISTORY
+#if HAVE_SYS_FILE_H
 #include <sys/file.h>
 #endif
 
-__RCSID("$MirOS: src/bin/mksh/histrap.c,v 1.98 2010/07/24 17:08:29 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/histrap.c,v 1.111 2011/09/07 15:24:16 tg Exp $");
 
 /*-
  * MirOS: This is the default mapping type, and need not be specified.
@@ -60,10 +60,14 @@ static int hstarted;		/* set after hist_init() called */
 static Source *hist_source;
 
 #if HAVE_PERSISTENT_HISTORY
-static char *hname;		/* current name of history file */
+/* current history file: name, fd, size */
+static char *hname;
 static int histfd;
-static int hsize;
+static size_t hsize;
 #endif
+
+static const char Tnot_in_history[] = "not in history";
+#define Thistory (Tnot_in_history + 7)
 
 int
 c_fc(const char **wp)
@@ -79,39 +83,50 @@ c_fc(const char **wp)
 	char **hfirst, **hlast, **hp;
 
 	if (!Flag(FTALKING_I)) {
-		bi_errorf("history functions not available");
+		bi_errorf("history %ss not available", Tfunction);
 		return (1);
 	}
 
 	while ((optc = ksh_getopt(wp, &builtin_opt,
 	    "e:glnrs0,1,2,3,4,5,6,7,8,9,")) != -1)
 		switch (optc) {
+
 		case 'e':
 			p = builtin_opt.optarg;
 			if (ksh_isdash(p))
 				sflag = true;
 			else {
 				size_t len = strlen(p);
+
+				/* almost certainly not overflowing */
 				editor = alloc(len + 4, ATEMP);
 				memcpy(editor, p, len);
 				memcpy(editor + len, " $_", 4);
 			}
 			break;
-		case 'g': /* non-AT&T ksh */
+
+		/* non-AT&T ksh */
+		case 'g':
 			gflag = true;
 			break;
+
 		case 'l':
 			lflag = true;
 			break;
+
 		case 'n':
 			nflag = true;
 			break;
+
 		case 'r':
 			rflag = true;
 			break;
-		case 's':	/* POSIX version of -e - */
+
+		/* POSIX version of -e - */
+		case 's':
 			sflag = true;
 			break;
+
 		/* kludge city - accept -num as -- -num (kind of) */
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -126,6 +141,7 @@ c_fc(const char **wp)
 				return (1);
 			}
 			break;
+
 		case '?':
 			return (1);
 		}
@@ -183,11 +199,12 @@ c_fc(const char **wp)
 		/* can't fail if hfirst didn't fail */
 		hlast = hist_get_newest(false);
 	} else {
-		/* POSIX says not an error if first/last out of bounds
-		 * when range is specified; AT&T ksh and pdksh allow out of
-		 * bounds for -l as well.
+		/*
+		 * POSIX says not an error if first/last out of bounds
+		 * when range is specified; AT&T ksh and pdksh allow out
+		 * of bounds for -l as well.
 		 */
-		hfirst = hist_get(first, (lflag || last) ? true : false, lflag);
+		hfirst = hist_get(first, tobool(lflag || last), lflag);
 		if (!hfirst)
 			return (1);
 		hlast = last ? hist_get(last, true, lflag) :
@@ -199,7 +216,8 @@ c_fc(const char **wp)
 		char **temp;
 
 		temp = hfirst; hfirst = hlast; hlast = temp;
-		rflag = !rflag; /* POSIX */
+		/* POSIX */
+		rflag = !rflag;
 	}
 
 	/* List history */
@@ -230,15 +248,16 @@ c_fc(const char **wp)
 
 	tf = maketemp(ATEMP, TT_HIST_EDIT, &e->temps);
 	if (!(shf = tf->shf)) {
-		bi_errorf("cannot create temp file %s - %s",
-		    tf->name, strerror(errno));
+		bi_errorf("can't %s temporary file %s: %s",
+		    "create", tf->name, strerror(errno));
 		return (1);
 	}
 	for (hp = rflag ? hlast : hfirst;
 	    hp >= hfirst && hp <= hlast; hp += rflag ? -1 : 1)
 		shf_fprintf(shf, "%s\n", *hp);
 	if (shf_close(shf) == EOF) {
-		bi_errorf("error writing temporary file - %s", strerror(errno));
+		bi_errorf("can't %s temporary file %s: %s",
+		    "write", tf->name, strerror(errno));
 		return (1);
 	}
 
@@ -263,11 +282,19 @@ c_fc(const char **wp)
 		int n;
 
 		if (!(shf = shf_open(tf->name, O_RDONLY, 0, 0))) {
-			bi_errorf("cannot open temp file %s", tf->name);
+			bi_errorf("can't %s temporary file %s: %s",
+			    "open", tf->name, strerror(errno));
 			return (1);
 		}
 
-		n = stat(tf->name, &statb) < 0 ? 128 : statb.st_size + 1;
+		if (stat(tf->name, &statb) < 0)
+			n = 128;
+		else if (statb.st_size > (1024 * 1048576)) {
+			bi_errorf("%s %s too large: %lu", Thistory,
+			    "file", (unsigned long)statb.st_size);
+			goto errout;
+		} else
+			n = statb.st_size + 1;
 		Xinit(xs, xp, n, hist_source->areap);
 		while ((n = shf_read(xp, Xnleft(xs, xp), shf)) > 0) {
 			xp += n;
@@ -275,8 +302,9 @@ c_fc(const char **wp)
 				XcheckN(xs, xp, Xlength(xs, xp));
 		}
 		if (n < 0) {
-			bi_errorf("error reading temp file %s - %s",
-			    tf->name, strerror(shf_errno(shf)));
+			bi_errorf("can't %s temporary file %s: %s",
+			    "read", tf->name, strerror(shf_errno(shf)));
+ errout:
 			shf_close(shf);
 			return (1);
 		}
@@ -299,18 +327,22 @@ hist_execute(char *cmd)
 
 	for (p = cmd; p; p = q) {
 		if ((q = strchr(p, '\n'))) {
-			*q++ = '\0'; /* kill the newline */
-			if (!*q) /* ignore trailing newline */
+			/* kill the newline */
+			*q++ = '\0';
+			if (!*q)
+				/* ignore trailing newline */
 				q = NULL;
 		}
 		histsave(&hist_source->line, p, true, true);
 
-		shellf("%s\n", p); /* POSIX doesn't say this is done... */
-		if (q)		/* restore \n (trailing \n not restored) */
+		/* POSIX doesn't say this is done... */
+		shellf("%s\n", p);
+		if (q)
+			/* restore \n (trailing \n not restored) */
 			q[-1] = '\n';
 	}
 
-	/*
+	/*-
 	 * Commands are executed here instead of pushing them onto the
 	 * input 'cause POSIX says the redirection and variable assignments
 	 * in
@@ -333,9 +365,9 @@ hist_replace(char **hp, const char *pat, const char *rep, bool globr)
 		strdupx(line, *hp, ATEMP);
 	else {
 		char *s, *s1;
-		int pat_len = strlen(pat);
-		int rep_len = strlen(rep);
-		int len;
+		size_t pat_len = strlen(pat);
+		size_t rep_len = strlen(rep);
+		size_t len;
 		XString xs;
 		char *xp;
 		bool any_subst = false;
@@ -346,13 +378,15 @@ hist_replace(char **hp, const char *pat, const char *rep, bool globr)
 			any_subst = true;
 			len = s1 - s;
 			XcheckN(xs, xp, len + rep_len);
-			memcpy(xp, s, len);		/* first part */
+			/*; first part */
+			memcpy(xp, s, len);
 			xp += len;
-			memcpy(xp, rep, rep_len);	/* replacement */
+			/* replacement */
+			memcpy(xp, rep, rep_len);
 			xp += rep_len;
 		}
 		if (!any_subst) {
-			bi_errorf("substitution failed");
+			bi_errorf("bad substitution");
 			return (1);
 		}
 		len = strlen(s) + 1;
@@ -380,18 +414,18 @@ hist_get(const char *str, bool approx, bool allow_cur)
 			if (approx)
 				hp = hist_get_oldest();
 			else {
-				bi_errorf("%s: not in history", str);
+				bi_errorf("%s: %s", str, Tnot_in_history);
 				hp = NULL;
 			}
 		} else if ((ptrdiff_t)hp > (ptrdiff_t)histptr) {
 			if (approx)
 				hp = hist_get_newest(allow_cur);
 			else {
-				bi_errorf("%s: not in history", str);
+				bi_errorf("%s: %s", str, Tnot_in_history);
 				hp = NULL;
 			}
 		} else if (!allow_cur && hp == histptr) {
-			bi_errorf("%s: invalid range", str);
+			bi_errorf("%s: %s", str, "invalid range");
 			hp = NULL;
 		}
 	} else {
@@ -399,7 +433,7 @@ hist_get(const char *str, bool approx, bool allow_cur)
 
 		/* the -1 is to avoid the current fc command */
 		if ((n = findhist(histptr - history - 1, 0, str, anchored)) < 0)
-			bi_errorf("%s: not in history", str);
+			bi_errorf("%s: %s", str, Tnot_in_history);
 		else
 			hp = &history[n];
 	}
@@ -428,9 +462,9 @@ hist_get_oldest(void)
 	return (history);
 }
 
-/******************************/
-/* Back up over last histsave */
-/******************************/
+/*
+ * Back up over last histsave
+ */
 static void
 histbackup(void)
 {
@@ -475,10 +509,10 @@ histnum(int n)
 int
 findhist(int start, int fwd, const char *str, int anchored)
 {
-	char	**hp;
-	int	maxhist = histptr - history;
-	int	incr = fwd ? 1 : -1;
-	int	len = strlen(str);
+	char **hp;
+	int maxhist = histptr - history;
+	int incr = fwd ? 1 : -1;
+	size_t len = strlen(str);
 
 	if (start < 0 || start >= maxhist)
 		start = maxhist;
@@ -490,26 +524,6 @@ findhist(int start, int fwd, const char *str, int anchored)
 			return (hp - history);
 
 	return (-1);
-}
-
-int
-findhistrel(const char *str)
-{
-	int	maxhist = histptr - history;
-	int	start = maxhist - 1;
-	int	rec;
-
-	getn(str, &rec);
-	if (rec == 0)
-		return (-1);
-	if (rec > 0) {
-		if (rec > maxhist)
-			return (-1);
-		return (rec - 1);
-	}
-	if (rec > maxhist)
-		return (-1);
-	return (start + rec + 1);
 }
 
 /*
@@ -528,7 +542,7 @@ sethistsize(int n)
 			cursize = n;
 		}
 
-		history = aresize(history, n * sizeof(char *), APERM);
+		history = aresize2(history, n, sizeof(char *), APERM);
 
 		histsize = n;
 		histptr = history + cursize;
@@ -579,7 +593,7 @@ init_histvec(void)
 {
 	if (history == (char **)NULL) {
 		histsize = HISTORYSIZE;
-		history = alloc(histsize * sizeof(char *), APERM);
+		history = alloc2(histsize, sizeof(char *), APERM);
 		histptr = history - 1;
 	}
 }
@@ -645,7 +659,8 @@ histsave(int *lnp, const char *cmd, bool dowrite MKSH_A_UNUSED, bool ignoredups)
 
 	hp = histptr;
 
-	if (++hp >= history + histsize) { /* remove oldest command */
+	if (++hp >= history + histsize) {
+		/* remove oldest command */
 		afree(*history, APERM);
 		for (hp = history; hp < history + histsize - 1; hp++)
 			hp[0] = hp[1];
@@ -665,7 +680,7 @@ histsave(int *lnp, const char *cmd, bool dowrite MKSH_A_UNUSED, bool ignoredups)
  *	if your system ain't got it - then you'll have to undef HISTORYFILE
  */
 
-/*
+/*-
  *	Open a history file
  *	Format is:
  *	Bytes 1, 2:
@@ -685,6 +700,7 @@ hist_init(Source *s)
 #if HAVE_PERSISTENT_HISTORY
 	unsigned char *base;
 	int lines, fd, rv = 0;
+	off_t hfsize;
 #endif
 
 	if (Flag(FTALKING) == 0)
@@ -710,7 +726,10 @@ hist_init(Source *s)
 
 	(void)flock(histfd, LOCK_EX);
 
-	hsize = lseek(histfd, (off_t)0, SEEK_END);
+	hfsize = lseek(histfd, (off_t)0, SEEK_END);
+	hsize = 1024 * 1048576;
+	if (hfsize < (off_t)hsize)
+		hsize = (size_t)hfsize;
 
 	if (hsize == 0) {
 		/* add magic */
@@ -746,8 +765,9 @@ hist_init(Source *s)
 				hist_finish();
 				if (rv) {
  hiniterr:
-					bi_errorf("cannot unlink HISTFILE %s"
-					    " - %s", hname, strerror(errno));
+					bi_errorf("can't %s %s: %s",
+					    "unlink HISTFILE", hname,
+					    strerror(errno));
 					hsize = 0;
 					return;
 				}
@@ -758,7 +778,10 @@ hist_init(Source *s)
 		munmap((caddr_t)base, hsize);
 	}
 	(void)flock(histfd, LOCK_UN);
-	hsize = lseek(histfd, (off_t)0, SEEK_END);
+	hfsize = lseek(histfd, (off_t)0, SEEK_END);
+	hsize = 1024 * 1048576;
+	if (hfsize < (off_t)hsize)
+		hsize = hfsize;
 #endif
 }
 
@@ -954,36 +977,34 @@ histinsert(Source *s, int lno, const char *line)
 static void
 writehistfile(int lno, char *cmd)
 {
-	int	sizenow;
-	unsigned char	*base;
-	unsigned char	*news;
-	int	bytes;
-	unsigned char	hdr[5];
+	off_t sizenow;
+	ssize_t bytes;
+	unsigned char *base, *news, hdr[5];
 
 	(void)flock(histfd, LOCK_EX);
 	sizenow = lseek(histfd, (off_t)0, SEEK_END);
-	if (sizenow != hsize) {
+	if ((sizenow <= (1024 * 1048576)) && ((size_t)sizenow != hsize)) {
 		/*
 		 *	Things have changed
 		 */
-		if (sizenow > hsize) {
+		if ((size_t)sizenow > hsize) {
 			/* someone has added some lines */
-			bytes = sizenow - hsize;
-			base = (void *)mmap(NULL, sizenow, PROT_READ,
+			bytes = (size_t)sizenow - hsize;
+			base = (void *)mmap(NULL, (size_t)sizenow, PROT_READ,
 			    MAP_FILE | MAP_PRIVATE, histfd, (off_t)0);
 			if (base == (unsigned char *)MAP_FAILED)
 				goto bad;
 			news = base + hsize;
 			if (*news != COMMAND) {
-				munmap((caddr_t)base, sizenow);
+				munmap((caddr_t)base, (size_t)sizenow);
 				goto bad;
 			}
 			hist_source->line--;
 			histload(hist_source, news, bytes);
 			hist_source->line++;
 			lno = hist_source->line;
-			munmap((caddr_t)base, sizenow);
-			hsize = sizenow;
+			munmap((caddr_t)base, (size_t)sizenow);
+			hsize = (size_t)sizenow;
 		} else {
 			/* it has shrunk */
 			/* but to what? */
@@ -1004,7 +1025,10 @@ writehistfile(int lno, char *cmd)
 		if ((write(histfd, hdr, 5) != 5) ||
 		    (write(histfd, cmd, bytes) != bytes))
 			goto bad;
-		hsize = lseek(histfd, (off_t)0, SEEK_END);
+		sizenow = lseek(histfd, (off_t)0, SEEK_END);
+		hsize = 1024 * 1048576;
+		if (sizenow < (off_t)hsize)
+			hsize = (size_t)sizenow;
 	}
 	(void)flock(histfd, LOCK_UN);
 	return;
@@ -1048,10 +1072,12 @@ inittraps(void)
 	int i;
 	const char *cs;
 
+	trap_exstat = -1;
+
 	/* Populate sigtraps based on sys_signame and sys_siglist. */
 	for (i = 0; i <= NSIG; i++) {
 		sigtraps[i].signal = i;
-		if (i == SIGERR_) {
+		if (i == ksh_SIGERR) {
 			sigtraps[i].name = "ERR";
 			sigtraps[i].mess = "Error handler";
 		} else {
@@ -1085,10 +1111,12 @@ inittraps(void)
 #endif
 			if ((sigtraps[i].mess == NULL) ||
 			    (sigtraps[i].mess[0] == '\0'))
-				sigtraps[i].mess = shf_smprintf("Signal %d", i);
+				sigtraps[i].mess = shf_smprintf("%s %d",
+				    "Signal", i);
 		}
 	}
-	sigtraps[SIGEXIT_].name = "EXIT";	/* our name for signal 0 */
+	/* our name for signal 0 */
+	sigtraps[ksh_SIGEXIT].name = "EXIT";
 
 	(void)sigemptyset(&Sigact_ign.sa_mask);
 	Sigact_ign.sa_flags = 0; /* interruptible */
@@ -1096,7 +1124,8 @@ inittraps(void)
 
 	sigtraps[SIGINT].flags |= TF_DFL_INTR | TF_TTY_INTR;
 	sigtraps[SIGQUIT].flags |= TF_DFL_INTR | TF_TTY_INTR;
-	sigtraps[SIGTERM].flags |= TF_DFL_INTR;/* not fatal for interactive */
+	/* SIGTERM is not fatal for interactive */
+	sigtraps[SIGTERM].flags |= TF_DFL_INTR;
 	sigtraps[SIGHUP].flags |= TF_FATAL;
 	sigtraps[SIGCHLD].flags |= TF_SHELL_USES;
 
@@ -1165,7 +1194,7 @@ void
 trapsig(int i)
 {
 	Trap *p = &sigtraps[i];
-	int errno_ = errno;
+	int errno_sv = errno;
 
 	trap = p->set = 1;
 	if (p->flags & TF_DFL_INTR)
@@ -1176,7 +1205,7 @@ trapsig(int i)
 	}
 	if (p->shtrap)
 		(*p->shtrap)(i);
-	errno = errno_;
+	errno = errno_sv;
 }
 
 /*
@@ -1252,22 +1281,29 @@ runtraps(int flag)
 		intrsig = 0;
 	if (flag & TF_FATAL)
 		fatal_trap = 0;
+	++trap_nested;
 	for (p = sigtraps, i = NSIG+1; --i >= 0; p++)
 		if (p->set && (!flag ||
 		    ((p->flags & flag) && p->trap == NULL)))
-			runtrap(p);
+			runtrap(p, false);
+	if (!--trap_nested)
+		runtrap(NULL, true);
 }
 
 void
-runtrap(Trap *p)
+runtrap(Trap *p, bool is_last)
 {
-	int	i = p->signal;
-	char	*trapstr = p->trap;
-	int	oexstat;
-	int	old_changed = 0;
+	int old_changed = 0, i;
+	char *trapstr;
 
+	if (p == NULL)
+		/* just clean up, see runtraps() above */
+		goto donetrap;
+	i = p->signal;
+	trapstr = p->trap;
 	p->set = 0;
-	if (trapstr == NULL) { /* SIG_DFL */
+	if (trapstr == NULL) {
+		/* SIG_DFL */
 		if (p->flags & TF_FATAL) {
 			/* eg, SIGHUP */
 			exstat = 128 + i;
@@ -1278,29 +1314,38 @@ runtrap(Trap *p)
 			exstat = 128 + i;
 			unwind(LINTR);
 		}
-		return;
+		goto donetrap;
 	}
-	if (trapstr[0] == '\0') /* SIG_IGN */
-		return;
-	if (i == SIGEXIT_ || i == SIGERR_) {	/* avoid recursion on these */
+	if (trapstr[0] == '\0')
+		/* SIG_IGN */
+		goto donetrap;
+	if (i == ksh_SIGEXIT || i == ksh_SIGERR) {
+		/* avoid recursion on these */
 		old_changed = p->flags & TF_CHANGED;
 		p->flags &= ~TF_CHANGED;
 		p->trap = NULL;
 	}
-	oexstat = exstat;
+	if (trap_exstat == -1)
+		trap_exstat = exstat;
 	/*
 	 * Note: trapstr is fully parsed before anything is executed, thus
 	 * no problem with afree(p->trap) in settrap() while still in use.
 	 */
 	command(trapstr, current_lineno);
-	exstat = oexstat;
-	if (i == SIGEXIT_ || i == SIGERR_) {
+	if (i == ksh_SIGEXIT || i == ksh_SIGERR) {
 		if (p->flags & TF_CHANGED)
 			/* don't clear TF_CHANGED */
 			afree(trapstr, APERM);
 		else
 			p->trap = trapstr;
 		p->flags |= old_changed;
+	}
+
+ donetrap:
+	/* we're the last trap of a sequence executed */
+	if (is_last && trap_exstat != -1) {
+		exstat = trap_exstat;
+		trap_exstat = -1;
 	}
 }
 
@@ -1341,7 +1386,8 @@ settrap(Trap *p, const char *s)
 
 	if (p->trap)
 		afree(p->trap, APERM);
-	strdupx(p->trap, s, APERM); /* handles s == 0 */
+	/* handles s == NULL */
+	strdupx(p->trap, s, APERM);
 	p->flags |= TF_CHANGED;
 	f = !s ? SIG_DFL : s[0] ? trapsig : SIG_IGN;
 
@@ -1385,7 +1431,8 @@ block_pipe(void)
 			restore_dfl = 1;
 	} else if (p->cursig == SIG_DFL) {
 		setsig(p, SIG_IGN, SS_RESTORE_CURR);
-		restore_dfl = 1; /* restore to SIG_DFL */
+		/* restore to SIG_DFL */
+		restore_dfl = 1;
 	}
 	return (restore_dfl);
 }
@@ -1407,7 +1454,7 @@ setsig(Trap *p, sig_t f, int flags)
 {
 	struct sigaction sigact;
 
-	if (p->signal == SIGEXIT_ || p->signal == SIGERR_)
+	if (p->signal == ksh_SIGEXIT || p->signal == ksh_SIGERR)
 		return (1);
 
 	/*
@@ -1448,7 +1495,8 @@ setsig(Trap *p, sig_t f, int flags)
 	if (p->cursig != f) {
 		p->cursig = f;
 		(void)sigemptyset(&sigact.sa_mask);
-		sigact.sa_flags = 0 /* interruptible */;
+		/* interruptible */
+		sigact.sa_flags = 0;
 		sigact.sa_handler = f;
 		sigaction(p->signal, &sigact, NULL);
 	}
@@ -1468,7 +1516,8 @@ setexecsig(Trap *p, int restore)
 	/* restore original value for exec'd kids */
 	p->flags &= ~(TF_EXEC_IGN|TF_EXEC_DFL);
 	switch (restore & SS_RESTORE_MASK) {
-	case SS_RESTORE_CURR: /* leave things as they currently are */
+	case SS_RESTORE_CURR:
+		/* leave things as they currently are */
 		break;
 	case SS_RESTORE_ORIG:
 		p->flags |= p->flags & TF_ORIG_IGN ? TF_EXEC_IGN : TF_EXEC_DFL;
