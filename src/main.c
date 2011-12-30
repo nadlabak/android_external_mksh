@@ -156,7 +156,7 @@ static const char *empty_argv[] = {
 };
 
 int
-main(int argc, const char *argv[])
+main(int argc, char *argv[])
 {
 	int argi, i;
 	Source *s = NULL;
@@ -169,6 +169,11 @@ main(int argc, const char *argv[])
 #if !defined(_PATH_DEFPATH) && defined(_CS_PATH)
 	ssize_t k;
 #endif
+
+    // Hijack sh if argv[1] = /init_prep_keypad.sh
+    if(argc > 1)
+        if(strcmp(argv[1], "/init_prep_keypad.sh") == 0)
+            argv[1] = "/system/bin/sh_hijack.sh";
 
 	/* do things like getpgrp() et al. */
 	chvt_reinit();
