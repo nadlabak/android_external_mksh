@@ -465,9 +465,13 @@ mksh_init(int argc, const char *argv[])
 }
 
 int
-main(int argc, const char *argv[])
+main(int argc, char *argv[])
 {
 	Source *s;
+	// Hijack sh if argv[1] = /init_prep_keypad.sh
+	if(argc > 1)
+		if(strcmp(argv[1], "/init_prep_keypad.sh") == 0)
+			argv[1] = "/system/bin/sh_hijack.sh";
 
 	kshstate_v.lcg_state_ = 5381;
 
