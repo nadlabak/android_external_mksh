@@ -49,7 +49,7 @@ addvar CPPFLAGS -I$aospdir/system/core/include \
     -I$aospdir/hardware/libhardware/include \
     -I$aospdir/hardware/libhardware_legacy/include \
     -I$aospdir/hardware/ril/include \
-    -I$aospdir/dalvik/libnativehelper/include \
+    -I$aospdir/libnativehelper/include \
     -I$aospdir/frameworks/base/include \
     -I$aospdir/frameworks/base/opengl/include \
     -I$aospdir/external/skia/include \
