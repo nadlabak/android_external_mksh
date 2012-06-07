@@ -4,7 +4,8 @@
 /*	$OpenBSD: c_ulimit.c,v 1.17 2008/03/21 12:51:19 millert Exp $	*/
 
 /*-
- * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010
+ * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+ *		 2010, 2011
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -25,7 +26,19 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/funcs.c,v 1.157 2010/08/24 14:42:01 tg Exp $");
+#if HAVE_SELECT
+#if HAVE_SYS_BSDTYPES_H
+#include <sys/bsdtypes.h>
+#endif
+#if HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
+#if HAVE_BSTRING_H
+#include <bstring.h>
+#endif
+#endif
+
+__RCSID("$MirOS: src/bin/mksh/funcs.c,v 1.197 2011/09/07 15:24:15 tg Exp $");
 
 #if HAVE_KILLPG
 /*
@@ -40,51 +53,69 @@ __RCSID("$MirOS: src/bin/mksh/funcs.c,v 1.157 2010/08/24 14:42:01 tg Exp $");
 
 /* XXX conditions correct? */
 #if !defined(RLIM_INFINITY) && !defined(MKSH_NO_LIMITS)
-#define MKSH_NO_LIMITS
+#define MKSH_NO_LIMITS	1
 #endif
 
 #ifdef MKSH_NO_LIMITS
-#define c_ulimit c_label
+#define c_ulimit	c_true
 #endif
 
-extern uint8_t set_refflag;
+#if defined(ANDROID)
+static int c_android_lsmod(const char **);
+#endif
 
-/* A leading = means assignments before command are kept;
+static int
+c_true(const char **wp MKSH_A_UNUSED)
+{
+	return (0);
+}
+
+static int
+c_false(const char **wp MKSH_A_UNUSED)
+{
+	return (1);
+}
+
+/*
+ * A leading = means assignments before command are kept;
  * a leading * means a POSIX special builtin;
  * a leading + means a POSIX regular builtin
  * (* and + should not be combined).
  */
 const struct builtin mkshbuiltins[] = {
 	{"*=.", c_dot},
-	{"*=:", c_label},
+	{"*=:", c_true},
 	{"[", c_test},
 	{"*=break", c_brkcont},
-	{"=builtin", c_builtin},
+	{Tgbuiltin, c_builtin},
 	{"*=continue", c_brkcont},
 	{"*=eval", c_eval},
 	{"*=exec", c_exec},
 	{"*=exit", c_exitreturn},
-	{"+false", c_label},
+	{"+false", c_false},
 	{"*=return", c_exitreturn},
-	{"*=set", c_set},
+	{Tsgset, c_set},
 	{"*=shift", c_shift},
 	{"=times", c_times},
 	{"*=trap", c_trap},
 	{"+=wait", c_wait},
 	{"+read", c_read},
 	{"test", c_test},
-	{"+true", c_label},
+	{"+true", c_true},
 	{"ulimit", c_ulimit},
 	{"+umask", c_umask},
 	{"*=unset", c_unset},
-	{"+alias", c_alias},	/* no =: AT&T manual wrong */
+	/* no =: AT&T manual wrong */
+	{Tpalias, c_alias},
 	{"+cd", c_cd},
-	{"chdir", c_cd},	/* dash compatibility hack */
+	/* dash compatibility hack */
+	{"chdir", c_cd},
 	{"+command", c_command},
 	{"echo", c_print},
 	{"*=export", c_typeset},
 	{"+fc", c_fc},
 	{"+getopts", c_getopts},
+	{"=global", c_typeset},
 	{"+jobs", c_jobs},
 	{"+kill", c_kill},
 	{"let", c_let},
@@ -94,19 +125,30 @@ const struct builtin mkshbuiltins[] = {
 #endif
 	{"pwd", c_pwd},
 	{"*=readonly", c_typeset},
-	{T__typeset, c_typeset},
-	{"+unalias", c_unalias},
+	{T_typeset, c_typeset},
+	{Tpunalias, c_unalias},
 	{"whence", c_whence},
 #ifndef MKSH_UNEMPLOYED
 	{"+bg", c_fgbg},
 	{"+fg", c_fgbg},
 #endif
 	{"bind", c_bind},
+	{"cat", c_cat},
 #if HAVE_MKNOD
 	{"mknod", c_mknod},
 #endif
 	{"realpath", c_realpath},
 	{"rename", c_rename},
+#if HAVE_SELECT
+	{"sleep", c_sleep},
+#endif
+#ifdef __MirBSD__
+	/* alias to "true" for historical reasons */
+	{"domainname", c_true},
+#endif
+#if defined(ANDROID)
+	{"lsmod", c_android_lsmod},
+#endif
 	{NULL, (int (*)(const char **))NULL}
 };
 
@@ -163,7 +205,6 @@ static const struct t_op b_ops[] = {
 	{"",	TO_NONOP }
 };
 
-static int test_eaccess(const char *, int);
 static int test_oexpr(Test_env *, bool);
 static int test_aexpr(Test_env *, bool);
 static int test_nexpr(Test_env *, bool);
@@ -171,331 +212,16 @@ static int test_primary(Test_env *, bool);
 static Test_op ptest_isa(Test_env *, Test_meta);
 static const char *ptest_getopnd(Test_env *, Test_op, bool);
 static void ptest_error(Test_env *, int, const char *);
-static char *kill_fmt_entry(char *, int, int, const void *);
+static char *kill_fmt_entry(char *, size_t, int, const void *);
 static void p_time(struct shf *, bool, long, int, int,
     const char *, const char *)
-    MKSH_A_NONNULL((nonnull (6, 7)));
-static char *do_realpath(const char *);
-
-static char *
-do_realpath(const char *upath)
-{
-	char *xp, *ip, *tp, *ipath, *ldest = NULL;
-	XString xs;
-	ptrdiff_t pos;
-	size_t len;
-	int symlinks = 32;	/* max. recursion depth */
-	int llen;
-	struct stat sb;
-#ifdef NO_PATH_MAX
-	size_t ldestlen = 0;
-#define pathlen sb.st_size
-#define pathcnd (ldestlen < (pathlen + 1))
-#else
-#define pathlen PATH_MAX
-#define pathcnd (!ldest)
-#endif
-
-	if (upath[0] == '/') {
-		/* upath is an absolute pathname */
-		strdupx(ipath, upath, ATEMP);
-	} else {
-		/* upath is a relative pathname, prepend cwd */
-		if ((tp = ksh_get_wd(NULL)) == NULL || tp[0] != '/')
-			return (NULL);
-		ipath = shf_smprintf("%s/%s", tp, upath);
-		afree(tp, ATEMP);
-	}
-
-	Xinit(xs, xp, strlen(ip = ipath) + 1, ATEMP);
-
-	while (*ip) {
-		/* skip slashes in input */
-		while (*ip == '/')
-			++ip;
-		if (!*ip)
-			break;
-
-		/* get next pathname component from input */
-		tp = ip;
-		while (*ip && *ip != '/')
-			++ip;
-		len = ip - tp;
-
-		/* check input for "." and ".." */
-		if (tp[0] == '.') {
-			if (len == 1)
-				/* just continue with the next one */
-				continue;
-			else if (len == 2 && tp[1] == '.') {
-				/* strip off last pathname component */
-				while (xp > Xstring(xs, xp))
-					if (*--xp == '/')
-						break;
-				/* then continue with the next one */
-				continue;
-			}
-		}
-
-		/* store output position away, then append slash to output */
-		pos = Xsavepos(xs, xp);
-		/* 1 for the '/' and len + 1 for tp and the NUL from below */
-		XcheckN(xs, xp, 1 + len + 1);
-		Xput(xs, xp, '/');
-
-		/* append next pathname component to output */
-		memcpy(xp, tp, len);
-		xp += len;
-		*xp = '\0';
-
-		/* lstat the current output, see if it's a symlink */
-		if (lstat(Xstring(xs, xp), &sb)) {
-			/* lstat failed */
-			if (errno == ENOENT) {
-				/* because the pathname does not exist */
-				while (*ip == '/')
-					/* skip any trailing slashes */
-					++ip;
-				/* no more components left? */
-				if (!*ip)
-					/* we can still return successfully */
-					break;
-				/* more components left? fall through */
-			}
-			/* not ENOENT or not at the end of ipath */
-			goto notfound;
-		}
-
-		/* check if we encountered a symlink? */
-		if (S_ISLNK(sb.st_mode)) {
-			/* reached maximum recursion depth? */
-			if (!symlinks--) {
-				/* yep, prevent infinite loops */
-				errno = ELOOP;
-				goto notfound;
-			}
-
-			/* get symlink(7) target */
-			if (pathcnd)
-				ldest = aresize(ldest, pathlen + 1, ATEMP);
-			llen = readlink(Xstring(xs, xp), ldest, pathlen);
-			if (llen < 0)
-				/* oops... */
-				goto notfound;
-			ldest[llen] = '\0';
-
-			/*
-			 * restart if symlink target is an absolute path,
-			 * otherwise continue with currently resolved prefix
-			 */
-			xp = (ldest[0] == '/') ? Xstring(xs, xp) :
-			    Xrestpos(xs, xp, pos);
-			tp = shf_smprintf("%s%s%s", ldest, *ip ? "/" : "", ip);
-			afree(ipath, ATEMP);
-			ip = ipath = tp;
-		}
-		/* otherwise (no symlink) merely go on */
-	}
-
-	/*
-	 * either found the target and successfully resolved it,
-	 * or found its parent directory and may create it
-	 */
-	if (Xlength(xs, xp) == 0)
-		/*
-		 * if the resolved pathname is "", make it "/",
-		 * otherwise do not add a trailing slash
-		 */
-		Xput(xs, xp, '/');
-	Xput(xs, xp, '\0');
-
-	/*
-	 * if source path had a trailing slash, check if target path
-	 * is not a non-directory existing file
-	 */
-	if (ip > ipath && ip[-1] == '/') {
-		if (stat(Xstring(xs, xp), &sb)) {
-			if (errno != ENOENT)
-				goto notfound;
-		} else if (!S_ISDIR(sb.st_mode)) {
-			errno = ENOTDIR;
-			goto notfound;
-		}
-		/* target now either does not exist or is a directory */
-	}
-
-	/* return target path */
-	if (ldest != NULL)
-		afree(ldest, ATEMP);
-	afree(ipath, ATEMP);
-	return (Xclose(xs, xp));
-
- notfound:
-	llen = errno;	/* save; free(3) might trash it */
-	if (ldest != NULL)
-		afree(ldest, ATEMP);
-	afree(ipath, ATEMP);
-	Xfree(xs, xp);
-	errno = llen;
-	return (NULL);
-
-#undef pathlen
-#undef pathcnd
-}
-
-int
-c_cd(const char **wp)
-{
-	int optc, rv, phys_path;
-	bool physical = Flag(FPHYSICAL) ? true : false;
-	int cdnode;			/* was a node from cdpath added in? */
-	bool printpath = false;		/* print where we cd'd? */
-	struct tbl *pwd_s, *oldpwd_s;
-	XString xs;
-	char *dir, *allocd = NULL, *tryp, *pwd, *cdpath;
-
-	while ((optc = ksh_getopt(wp, &builtin_opt, "LP")) != -1)
-		switch (optc) {
-		case 'L':
-			physical = false;
-			break;
-		case 'P':
-			physical = true;
-			break;
-		case '?':
-			return (1);
-		}
-	wp += builtin_opt.optind;
-
-	if (Flag(FRESTRICTED)) {
-		bi_errorf("restricted shell - can't cd");
-		return (1);
-	}
-
-	pwd_s = global("PWD");
-	oldpwd_s = global("OLDPWD");
-
-	if (!wp[0]) {
-		/* No arguments - go home */
-		if ((dir = str_val(global("HOME"))) == null) {
-			bi_errorf("no home directory (HOME not set)");
-			return (1);
-		}
-	} else if (!wp[1]) {
-		/* One argument: - or dir */
-		strdupx(allocd, wp[0], ATEMP);
-		if (ksh_isdash((dir = allocd))) {
-			afree(allocd, ATEMP);
-			allocd = NULL;
-			dir = str_val(oldpwd_s);
-			if (dir == null) {
-				bi_errorf("no OLDPWD");
-				return (1);
-			}
-			printpath = true;
-		}
-	} else if (!wp[2]) {
-		/* Two arguments - substitute arg1 in PWD for arg2 */
-		int ilen, olen, nlen, elen;
-		char *cp;
-
-		if (!current_wd[0]) {
-			bi_errorf("don't know current directory");
-			return (1);
-		}
-		/* substitute arg1 for arg2 in current path.
-		 * if the first substitution fails because the cd fails
-		 * we could try to find another substitution. For now
-		 * we don't
-		 */
-		if ((cp = strstr(current_wd, wp[0])) == NULL) {
-			bi_errorf("bad substitution");
-			return (1);
-		}
-		ilen = cp - current_wd;
-		olen = strlen(wp[0]);
-		nlen = strlen(wp[1]);
-		elen = strlen(current_wd + ilen + olen) + 1;
-		dir = allocd = alloc(ilen + nlen + elen, ATEMP);
-		memcpy(dir, current_wd, ilen);
-		memcpy(dir + ilen, wp[1], nlen);
-		memcpy(dir + ilen + nlen, current_wd + ilen + olen, elen);
-		printpath = true;
-	} else {
-		bi_errorf("too many arguments");
-		return (1);
-	}
-
-#ifdef NO_PATH_MAX
-	/* only a first guess; make_path will enlarge xs if necessary */
-	XinitN(xs, 1024, ATEMP);
-#else
-	XinitN(xs, PATH_MAX, ATEMP);
-#endif
-
-	cdpath = str_val(global("CDPATH"));
-	do {
-		cdnode = make_path(current_wd, dir, &cdpath, &xs, &phys_path);
-		if (physical)
-			rv = chdir(tryp = Xstring(xs, xp) + phys_path);
-		else {
-			simplify_path(Xstring(xs, xp));
-			rv = chdir(tryp = Xstring(xs, xp));
-		}
-	} while (rv < 0 && cdpath != NULL);
-
-	if (rv < 0) {
-		if (cdnode)
-			bi_errorf("%s: bad directory", dir);
-		else
-			bi_errorf("%s - %s", tryp, strerror(errno));
-		afree(allocd, ATEMP);
-		return (1);
-	}
-
-	/* allocd (above) => dir, which is no longer used */
-	afree(allocd, ATEMP);
-	allocd = NULL;
-
-	/* Clear out tracked aliases with relative paths */
-	flushcom(0);
-
-	/* Set OLDPWD (note: unsetting OLDPWD does not disable this
-	 * setting in AT&T ksh)
-	 */
-	if (current_wd[0])
-		/* Ignore failure (happens if readonly or integer) */
-		setstr(oldpwd_s, current_wd, KSH_RETURN_ERROR);
-
-	if (Xstring(xs, xp)[0] != '/') {
-		pwd = NULL;
-	} else if (!physical || !(pwd = allocd = do_realpath(Xstring(xs, xp))))
-		pwd = Xstring(xs, xp);
-
-	/* Set PWD */
-	if (pwd) {
-		char *ptmp = pwd;
-
-		set_current_wd(ptmp);
-		/* Ignore failure (happens if readonly or integer) */
-		setstr(pwd_s, ptmp, KSH_RETURN_ERROR);
-	} else {
-		set_current_wd(null);
-		pwd = Xstring(xs, xp);
-		/* XXX unset $PWD? */
-	}
-	if (printpath || cdnode)
-		shprintf("%s\n", pwd);
-
-	afree(allocd, ATEMP);
-	return (0);
-}
+    MKSH_A_NONNULL((__nonnull__ (6, 7)));
 
 int
 c_pwd(const char **wp)
 {
 	int optc;
-	bool physical = Flag(FPHYSICAL) ? true : false;
+	bool physical = tobool(Flag(FPHYSICAL));
 	char *p, *allocd = NULL;
 
 	while ((optc = ksh_getopt(wp, &builtin_opt, "LP")) != -1)
@@ -517,10 +243,12 @@ c_pwd(const char **wp)
 	}
 	p = current_wd[0] ? (physical ? allocd = do_realpath(current_wd) :
 	    current_wd) : NULL;
+	/* LINTED use of access */
 	if (p && access(p, R_OK) < 0)
 		p = NULL;
-	if (!p && !(p = allocd = ksh_get_wd(NULL))) {
-		bi_errorf("can't get current directory - %s", strerror(errno));
+	if (!p && !(p = allocd = ksh_get_wd())) {
+		bi_errorf("%s: %s", "can't determine current directory",
+		    strerror(errno));
 		return (1);
 	}
 	shprintf("%s\n", p);
@@ -549,7 +277,7 @@ c_print(const char **wp)
 	if (wp[0][0] == 'e') {
 		/* echo builtin */
 		wp++;
-		if (Flag(FPOSIX) || Flag(FSH)) {
+		if (Flag(FPOSIX) || Flag(FSH) || Flag(FAS_BUILTIN)) {
 			/* Debian Policy 10.4 compliant "echo" builtin */
 			if (*wp && !strcmp(*wp, "-n")) {
 				/* we recognise "-n" only as the first arg */
@@ -599,7 +327,8 @@ c_print(const char **wp)
 
 		while ((optc = ksh_getopt(wp, &builtin_opt, opts)) != -1)
 			switch (optc) {
-			case 'R': /* fake BSD echo command */
+			case 'R':
+				/* fake BSD echo command */
 				flags |= PO_PMINUSMINUS;
 				flags &= ~PO_EXPAND;
 				opts = "ne";
@@ -612,7 +341,7 @@ c_print(const char **wp)
 				break;
 			case 'p':
 				if ((fd = coproc_getfd(W_OK, &emsg)) < 0) {
-					bi_errorf("-p: %s", emsg);
+					bi_errorf("%s: %s", "-p", emsg);
 					return (1);
 				}
 				break;
@@ -626,7 +355,7 @@ c_print(const char **wp)
 				if (!*(s = builtin_opt.optarg))
 					fd = 0;
 				else if ((fd = check_fd(s, W_OK, &emsg)) < 0) {
-					bi_errorf("-u: %s: %s", s, emsg);
+					bi_errorf("%s: %s: %s", "-u", s, emsg);
 					return (1);
 				}
 				break;
@@ -672,8 +401,7 @@ c_print(const char **wp)
 					/* generic function returned Unicode */
 					char ts[4];
 
-					c = utf_wctomb(ts, c - 0x100);
-					ts[c] = 0;
+					ts[utf_wctomb(ts, c - 0x100)] = 0;
 					for (c = 0; ts[c]; ++c)
 						Xput(xs, xp, ts[c]);
 					continue;
@@ -695,7 +423,8 @@ c_print(const char **wp)
 		int len = Xlength(xs, xp);
 		int opipe = 0;
 
-		/* Ensure we aren't killed by a SIGPIPE while writing to
+		/*
+		 * Ensure we aren't killed by a SIGPIPE while writing to
 		 * a coprocess. AT&T ksh doesn't seem to do this (seems
 		 * to just check that the co-process is alive which is
 		 * not enough).
@@ -770,7 +499,8 @@ c_whence(const char **wp)
 		/* Note that -p on its own is deal with in comexec() */
 		if (pflag)
 			fcflags |= FC_DEFPATH;
-		/* Convert command options to whence options - note that
+		/*
+		 * Convert command options to whence options - note that
 		 * command -pV uses a different path search than whence -v
 		 * or whence -pv. This should be considered a feature.
 		 */
@@ -795,22 +525,32 @@ c_whence(const char **wp)
 		if (vflag || (tp->type != CALIAS && tp->type != CEXEC &&
 		    tp->type != CTALIAS))
 			shf_puts(id, shl_stdout);
+		if (vflag)
+			switch (tp->type) {
+			case CKEYWD:
+			case CALIAS:
+			case CFUNC:
+			case CSHELL:
+				shf_puts(" is a", shl_stdout);
+				break;
+			}
+
 		switch (tp->type) {
 		case CKEYWD:
 			if (vflag)
-				shf_puts(" is a reserved word", shl_stdout);
+				shf_puts(" reserved word", shl_stdout);
 			break;
 		case CALIAS:
 			if (vflag)
-				shprintf(" is an %salias for ",
-				    (tp->flag & EXPORT) ? "exported " : null);
+				shprintf("n %s%s for ",
+				    (tp->flag & EXPORT) ? "exported " : null,
+				    Talias);
 			if (!iam_whence && !vflag)
-				shprintf("alias %s=", id);
+				shprintf("%s %s=", Talias, id);
 			print_value_quoted(tp->val.s);
 			break;
 		case CFUNC:
 			if (vflag) {
-				shf_puts(" is a", shl_stdout);
 				if (tp->flag & EXPORT)
 					shf_puts("n exported", shl_stdout);
 				if (tp->flag & TRACE)
@@ -821,13 +561,14 @@ c_whence(const char **wp)
 						shprintf(" (autoload from %s)",
 						    tp->u.fpath);
 				}
-				shf_puts(" function", shl_stdout);
+				shf_puts(T_function, shl_stdout);
 			}
 			break;
 		case CSHELL:
 			if (vflag)
-				shprintf(" is a%s shell builtin",
-				    (tp->flag & SPEC_BI) ? " special" : null);
+				shprintf("%s %s %s",
+				    (tp->flag & SPEC_BI) ? " special" : null,
+				    "shell", Tbuiltin);
 			break;
 		case CTALIAS:
 		case CEXEC:
@@ -835,14 +576,15 @@ c_whence(const char **wp)
 				if (vflag) {
 					shf_puts(" is ", shl_stdout);
 					if (tp->type == CTALIAS)
-						shprintf("a tracked %salias for ",
+						shprintf("a tracked %s%s for ",
 						    (tp->flag & EXPORT) ?
-						    "exported " : null);
+						    "exported " : null,
+						    Talias);
 				}
 				shf_puts(tp->val.s, shl_stdout);
 			} else {
 				if (vflag)
-					shf_puts(" not found", shl_stdout);
+					shprintf(" %s\n", "not found");
 				rv = 1;
 			}
 			break;
@@ -860,37 +602,46 @@ c_whence(const char **wp)
 int
 c_command(const char **wp)
 {
-	/* Let c_whence do the work. Note that c_command() must be
+	/*
+	 * Let c_whence do the work. Note that c_command() must be
 	 * a distinct function from c_whence() (tested in comexec()).
 	 */
 	return (c_whence(wp));
 }
 
-/* typeset, export, and readonly */
+/* typeset, global, export, and readonly */
 int
 c_typeset(const char **wp)
 {
 	struct block *l;
 	struct tbl *vp, **p;
-	Tflag fset = 0, fclr = 0, flag;
+	uint32_t fset = 0, fclr = 0, flag;
 	int thing = 0, field, base, optc;
 	const char *opts;
 	const char *fieldstr, *basestr;
 	bool localv = false, func = false, pflag = false, istset = true;
 
 	switch (**wp) {
-	case 'e':		/* export */
+
+	/* export */
+	case 'e':
 		fset |= EXPORT;
 		istset = false;
 		break;
-	case 'r':		/* readonly */
+
+	/* readonly */
+	case 'r':
 		fset |= RDONLY;
 		istset = false;
 		break;
-	case 's':		/* set */
+
+	/* set */
+	case 's':
 		/* called with 'typeset -' */
 		break;
-	case 't':		/* typeset */
+
+	/* typeset */
+	case 't':
 		localv = true;
 		break;
 	}
@@ -900,7 +651,8 @@ c_typeset(const char **wp)
 
 	fieldstr = basestr = NULL;
 	builtin_opt.flags |= GF_PLUSOPT;
-	/* AT&T ksh seems to have 0-9 as options which are multiplied
+	/*
+	 * AT&T ksh seems to have 0-9 as options which are multiplied
 	 * to get a number that is used with -L, -R, -Z or -i (eg, -1R2
 	 * sets right justify in a field of 12). This allows options
 	 * to be grouped in an order (eg, -Lu12), but disallows -i8 -L3 and
@@ -920,7 +672,8 @@ c_typeset(const char **wp)
 			fieldstr = builtin_opt.optarg;
 			break;
 		case 'U':
-			/* AT&T ksh uses u, but this conflicts with
+			/*
+			 * AT&T ksh uses u, but this conflicts with
 			 * upper/lower case. If this option is changed,
 			 * need to change the -U below as well
 			 */
@@ -948,10 +701,11 @@ c_typeset(const char **wp)
 			flag = LCASEV;
 			break;
 		case 'n':
-			set_refflag = (builtin_opt.info & GI_PLUS) ? 2 : 1;
+			set_refflag = (builtin_opt.info & GI_PLUS) ?
+			    SRF_DISABLE : SRF_ENABLE;
 			break;
+		/* export, readonly: POSIX -p flag */
 		case 'p':
-			/* export, readonly: POSIX -p flag */
 			/* typeset: show values as well */
 			pflag = true;
 			if (istset)
@@ -964,7 +718,8 @@ c_typeset(const char **wp)
 			flag = TRACE;
 			break;
 		case 'u':
-			flag = UCASEV_AL;	/* upper case / autoload */
+			/* upper case / autoload */
+			flag = UCASEV_AL;
 			break;
 		case 'x':
 			flag = EXPORT;
@@ -998,29 +753,35 @@ c_typeset(const char **wp)
 		builtin_opt.optind++;
 	}
 
-	if (func && (((fset|fclr) & ~(TRACE|UCASEV_AL|EXPORT)) || set_refflag)) {
+	if (func && (((fset|fclr) & ~(TRACE|UCASEV_AL|EXPORT)) ||
+	    set_refflag != SRF_NOP)) {
 		bi_errorf("only -t, -u and -x options may be used with -f");
-		set_refflag = 0;
+		set_refflag = SRF_NOP;
 		return (1);
 	}
 	if (wp[builtin_opt.optind]) {
-		/* Take care of exclusions.
+		/*
+		 * Take care of exclusions.
 		 * At this point, flags in fset are cleared in fclr and vice
 		 * versa. This property should be preserved.
 		 */
-		if (fset & LCASEV)	/* LCASEV has priority over UCASEV_AL */
+		if (fset & LCASEV)
+			/* LCASEV has priority over UCASEV_AL */
 			fset &= ~UCASEV_AL;
-		if (fset & LJUST)	/* LJUST has priority over RJUST */
+		if (fset & LJUST)
+			/* LJUST has priority over RJUST */
 			fset &= ~RJUST;
-		if ((fset & (ZEROFIL|LJUST)) == ZEROFIL) { /* -Z implies -ZR */
+		if ((fset & (ZEROFIL|LJUST)) == ZEROFIL) {
+			/* -Z implies -ZR */
 			fset |= RJUST;
 			fclr &= ~RJUST;
 		}
-		/* Setting these attributes clears the others, unless they
+		/*
+		 * Setting these attributes clears the others, unless they
 		 * are also set in this command
 		 */
 		if ((fset & (LJUST | RJUST | ZEROFIL | UCASEV_AL | LCASEV |
-		    INTEGER | INT_U | INT_L)) || set_refflag)
+		    INTEGER | INT_U | INT_L)) || set_refflag != SRF_NOP)
 			fclr |= ~fset & (LJUST | RJUST | ZEROFIL | UCASEV_AL |
 			    LCASEV | INTEGER | INT_U | INT_L);
 	}
@@ -1035,7 +796,7 @@ c_typeset(const char **wp)
 		for (i = builtin_opt.optind; wp[i]; i++) {
 			if (func) {
 				f = findfunc(wp[i], hash(wp[i]),
-				    (fset&UCASEV_AL) ? true : false);
+				    tobool(fset & UCASEV_AL));
 				if (!f) {
 					/* AT&T ksh does ++rv: bogus */
 					rv = 1;
@@ -1044,34 +805,38 @@ c_typeset(const char **wp)
 				if (fset | fclr) {
 					f->flag |= fset;
 					f->flag &= ~fclr;
-				} else
-					fptreef(shl_stdout, 0,
-					    f->flag & FKSH ?
-					    "function %s %T\n" :
-					    "%s() %T\n", wp[i], f->val.t);
+				} else {
+					fpFUNCTf(shl_stdout, 0,
+					    tobool(f->flag & FKSH),
+					    wp[i], f->val.t);
+					shf_putc('\n', shl_stdout);
+				}
 			} else if (!typeset(wp[i], fset, fclr, field, base)) {
-				bi_errorf("%s: not identifier", wp[i]);
-				set_refflag = 0;
+				bi_errorf("%s: %s", wp[i], "not identifier");
+				set_refflag = SRF_NOP;
 				return (1);
 			}
 		}
-		set_refflag = 0;
+		set_refflag = SRF_NOP;
 		return (rv);
 	}
 
 	/* list variables and attributes */
-	flag = fset | fclr; /* no difference at this point.. */
+
+	/* no difference at this point.. */
+	flag = fset | fclr;
 	if (func) {
 		for (l = e->loc; l; l = l->next) {
 			for (p = ktsort(&l->funs); (vp = *p++); ) {
 				if (flag && (vp->flag & flag) == 0)
 					continue;
 				if (thing == '-')
-					fptreef(shl_stdout, 0, vp->flag & FKSH ?
-					    "function %s %T\n" : "%s() %T\n",
+					fpFUNCTf(shl_stdout, 0,
+					    tobool(vp->flag & FKSH),
 					    vp->name, vp->val.t);
 				else
-					shprintf("%s\n", vp->name);
+					shf_puts(vp->name, shl_stdout);
+				shf_putc('\n', shl_stdout);
 			}
 		}
 	} else {
@@ -1103,15 +868,18 @@ c_typeset(const char **wp)
 				if (flag && (vp->flag & flag) == 0)
 					continue;
 				for (; vp; vp = vp->u.array) {
-					/* Ignore array elements that aren't
+					/*
+					 * Ignore array elements that aren't
 					 * set unless there are no set elements,
-					 * in which case the first is reported on */
+					 * in which case the first is reported on
+					 */
 					if ((vp->flag&ARRAY) && any_set &&
 					    !(vp->flag & ISSET))
 						continue;
 					/* no arguments */
 					if (thing == 0 && flag == 0) {
-						/* AT&T ksh prints things
+						/*
+						 * AT&T ksh prints things
 						 * like export, integer,
 						 * leftadj, zerofill, etc.,
 						 * but POSIX says must
@@ -1119,34 +887,36 @@ c_typeset(const char **wp)
 						 */
 						shf_puts("typeset ", shl_stdout);
 						if (((vp->flag&(ARRAY|ASSOC))==ASSOC))
-							shf_puts("-n ", shl_stdout);
+							shprintf("%s ", "-n");
 						if ((vp->flag&INTEGER))
-							shf_puts("-i ", shl_stdout);
+							shprintf("%s ", "-i");
 						if ((vp->flag&EXPORT))
-							shf_puts("-x ", shl_stdout);
+							shprintf("%s ", "-x");
 						if ((vp->flag&RDONLY))
-							shf_puts("-r ", shl_stdout);
+							shprintf("%s ", "-r");
 						if ((vp->flag&TRACE))
-							shf_puts("-t ", shl_stdout);
+							shprintf("%s ", "-t");
 						if ((vp->flag&LJUST))
 							shprintf("-L%d ", vp->u2.field);
 						if ((vp->flag&RJUST))
 							shprintf("-R%d ", vp->u2.field);
 						if ((vp->flag&ZEROFIL))
-							shf_puts("-Z ", shl_stdout);
+							shprintf("%s ", "-Z");
 						if ((vp->flag&LCASEV))
-							shf_puts("-l ", shl_stdout);
+							shprintf("%s ", "-l");
 						if ((vp->flag&UCASEV_AL))
-							shf_puts("-u ", shl_stdout);
+							shprintf("%s ", "-u");
 						if ((vp->flag&INT_U))
-							shf_puts("-U ", shl_stdout);
+							shprintf("%s ", "-U");
 						shf_puts(vp->name, shl_stdout);
 						if (pflag) {
 							char *s = str_val(vp);
 
 							shf_putc('=', shl_stdout);
-							/* AT&T ksh can't have
-							 * justified integers.. */
+							/*
+							 * AT&T ksh can't have
+							 * justified integers...
+							 */
 							if ((vp->flag &
 							    (INTEGER|LJUST|RJUST)) ==
 							    INTEGER)
@@ -1175,8 +945,10 @@ c_typeset(const char **wp)
 							char *s = str_val(vp);
 
 							shf_putc('=', shl_stdout);
-							/* AT&T ksh can't have
-							 * justified integers.. */
+							/*
+							 * AT&T ksh can't have
+							 * justified integers...
+							 */
 							if ((vp->flag &
 							    (INTEGER|LJUST|RJUST)) ==
 							    INTEGER)
@@ -1186,7 +958,8 @@ c_typeset(const char **wp)
 						}
 						shf_putc('\n', shl_stdout);
 					}
-					/* Only report first 'element' of an array with
+					/*
+					 * Only report first 'element' of an array with
 					 * no set elements.
 					 */
 					if (!any_set)
@@ -1204,7 +977,7 @@ c_alias(const char **wp)
 	struct table *t = &aliases;
 	int rv = 0, prefix = 0;
 	bool rflag = false, tflag, Uflag = false, pflag = false;
-	Tflag xflag = 0;
+	uint32_t xflag = 0;
 	int optc;
 
 	builtin_opt.flags |= GF_PLUSOPT;
@@ -1258,12 +1031,12 @@ c_alias(const char **wp)
 	/* "hash -r" means reset all the tracked aliases.. */
 	if (rflag) {
 		static const char *args[] = {
-			"unalias", "-ta", NULL
+			Tunalias, "-ta", NULL
 		};
 
 		if (!tflag || *wp) {
-			shf_puts("alias: -r flag can only be used with -t"
-			    " and without arguments\n", shl_stdout);
+			shprintf("%s: -r flag can only be used with -t"
+			    " and without arguments\n", Talias);
 			return (1);
 		}
 		ksh_getopt_reset(&builtin_opt, GF_ERROR);
@@ -1276,7 +1049,7 @@ c_alias(const char **wp)
 		for (p = ktsort(t); (ap = *p++) != NULL; )
 			if ((ap->flag & (ISSET|xflag)) == (ISSET|xflag)) {
 				if (pflag)
-					shf_puts("alias ", shl_stdout);
+					shprintf("%s ", Talias);
 				shf_puts(ap->name, shl_stdout);
 				if (prefix != '+') {
 					shf_putc('=', shl_stdout);
@@ -1301,7 +1074,7 @@ c_alias(const char **wp)
 			ap = ktsearch(t, alias, h);
 			if (ap != NULL && (ap->flag&ISSET)) {
 				if (pflag)
-					shf_puts("alias ", shl_stdout);
+					shprintf("%s ", Talias);
 				shf_puts(ap->name, shl_stdout);
 				if (prefix != '+') {
 					shf_putc('=', shl_stdout);
@@ -1309,7 +1082,8 @@ c_alias(const char **wp)
 				}
 				shf_putc('\n', shl_stdout);
 			} else {
-				shprintf("%s alias not found\n", alias);
+				shprintf("%s %s %s\n", alias, Talias,
+				    "not found");
 				rv = 1;
 			}
 			continue;
@@ -1323,7 +1097,9 @@ c_alias(const char **wp)
 				afree(ap->val.s, APERM);
 			}
 			/* ignore values for -t (AT&T ksh does this) */
-			newval = tflag ? search(alias, path, X_OK, NULL) : val;
+			newval = tflag ?
+			    search_path(alias, path, X_OK, NULL) :
+			    val;
 			if (newval) {
 				strdupx(ap->val.s, newval, APERM);
 				ap->flag |= ALLOC|ISSET;
@@ -1356,7 +1132,8 @@ c_unalias(const char **wp)
 			break;
 		case 'd':
 #ifdef MKSH_NOPWNAM
-			t = NULL;	/* fix "unalias -dt" */
+			/* fix "unalias -dt" */
+			t = NULL;
 #else
 			t = &homedirs;
 #endif
@@ -1376,7 +1153,8 @@ c_unalias(const char **wp)
 	for (; *wp != NULL; wp++) {
 		ap = ktsearch(t, *wp, hash(*wp));
 		if (ap == NULL) {
-			rv = 1;	/* POSIX */
+			/* POSIX */
+			rv = 1;
 			continue;
 		}
 		if (ap->flag&ALLOC) {
@@ -1407,12 +1185,14 @@ c_let(const char **wp)
 	int rv = 1;
 	mksh_ari_t val;
 
-	if (wp[1] == NULL) /* AT&T ksh does this */
+	if (wp[1] == NULL)
+		/* AT&T ksh does this */
 		bi_errorf("no arguments");
 	else
 		for (wp++; *wp; wp++)
 			if (!evaluate(*wp, &val, KSH_RETURN_ERROR, true)) {
-				rv = 2;	/* distinguish error from zero result */
+				/* distinguish error from zero result */
+				rv = 2;
 				break;
 			} else
 				rv = val == 0;
@@ -1435,7 +1215,8 @@ c_jobs(const char **wp)
 		case 'n':
 			nflag = 1;
 			break;
-		case 'z':	/* debugging: print zombies */
+		case 'z':
+			/* debugging: print zombies */
 			nflag = -1;
 			break;
 		case '?':
@@ -1478,7 +1259,7 @@ c_fgbg(const char **wp)
 
 /* format a single kill item */
 static char *
-kill_fmt_entry(char *buf, int buflen, int i, const void *arg)
+kill_fmt_entry(char *buf, size_t buflen, int i, const void *arg)
 {
 	const struct kill_info *ki = (const struct kill_info *)arg;
 
@@ -1549,7 +1330,8 @@ c_kill(const char **wp)
 					shprintf("%d\n", n);
 			}
 		} else {
-			int w, j, mess_cols, mess_octs;
+			ssize_t w, mess_cols, mess_octs;
+			int j;
 			struct kill_info ki;
 
 			for (j = NSIG, ki.num_width = 1; j >= 10; j /= 10)
@@ -1582,8 +1364,8 @@ c_kill(const char **wp)
 			if (j_kill(p, sig))
 				rv = 1;
 		} else if (!getn(p, &n)) {
-			bi_errorf("%s: arguments must be jobs or process IDs",
-			    p);
+			bi_errorf("%s: %s", p,
+			    "arguments must be jobs or process IDs");
 			rv = 1;
 		} else {
 			if (mksh_kill(n, sig) < 0) {
@@ -1618,22 +1400,22 @@ c_getopts(const char **wp)
 
 	opts = *wp++;
 	if (!opts) {
-		bi_errorf("missing options argument");
+		bi_errorf("missing %s argument", "options");
 		return (1);
 	}
 
 	var = *wp++;
 	if (!var) {
-		bi_errorf("missing name argument");
+		bi_errorf("missing %s argument", "name");
 		return (1);
 	}
 	if (!*var || *skip_varname(var, true)) {
-		bi_errorf("%s: is not an identifier", var);
+		bi_errorf("%s: %s", var, "is not an identifier");
 		return (1);
 	}
 
 	if (e->loc->next == NULL) {
-		internal_warningf("c_getopts: no argv");
+		internal_warningf("%s: %s", "c_getopts", "no argv");
 		return (1);
 	}
 	/* Which arguments are we parsing... */
@@ -1660,7 +1442,8 @@ c_getopts(const char **wp)
 		buf[1] = optc;
 		buf[2] = '\0';
 	} else {
-		/* POSIX says var is set to ? at end-of-options, AT&T ksh
+		/*
+		 * POSIX says var is set to ? at end-of-options, AT&T ksh
 		 * sets it to null - we go with POSIX...
 		 */
 		buf[0] = optc < 0 ? '?' : optc;
@@ -1671,7 +1454,8 @@ c_getopts(const char **wp)
 	user_opt.uoptind = user_opt.optind;
 
 	voptarg = global("OPTARG");
-	voptarg->flag &= ~RDONLY;	/* AT&T ksh clears ro and int */
+	/* AT&T ksh clears ro and int */
+	voptarg->flag &= ~RDONLY;
 	/* Paranoia: ensure no bizarre results. */
 	if (voptarg->flag & INTEGER)
 	    typeset("OPTARG", 0, INTEGER, 0, 0);
@@ -1686,7 +1470,7 @@ c_getopts(const char **wp)
 	vq = global(var);
 	/* Error message already printed (integer, readonly) */
 	if (!setstr(vq, buf, KSH_RETURN_ERROR))
-		rv = 1;
+		rv = 2;
 	if (Flag(FEXPORT))
 		typeset(var, EXPORT, 0, 0, 0);
 
@@ -1725,7 +1509,8 @@ c_bind(const char **wp)
 		}
 	wp += builtin_opt.optind;
 
-	if (*wp == NULL)	/* list all */
+	if (*wp == NULL)
+		/* list all */
 		rv = x_bind(NULL, NULL,
 #ifndef MKSH_SMALL
 		    false,
@@ -1751,13 +1536,6 @@ c_bind(const char **wp)
 	return (rv);
 }
 
-/* :, false and true (and ulimit if MKSH_NO_LIMITS) */
-int
-c_label(const char **wp)
-{
-	return (wp[0][0] == 'f' ? 1 : 0);
-}
-
 int
 c_shift(const char **wp)
 {
@@ -1776,7 +1554,7 @@ c_shift(const char **wp)
 	} else
 		n = 1;
 	if (n < 0) {
-		bi_errorf("%s: bad number", arg);
+		bi_errorf("%s: %s", arg, "bad number");
 		return (1);
 	}
 	if (l->argc < n) {
@@ -1843,7 +1621,8 @@ c_umask(const char **wp)
 			char op;
 
 			old_umask = umask((mode_t)0);
-			umask(old_umask); /* in case of error */
+			/* in case of error */
+			umask(old_umask);
 			old_umask = ~old_umask;
 			new_umask = old_umask;
 			positions = 0;
@@ -1864,7 +1643,8 @@ c_umask(const char **wp)
 						break;
 					}
 				if (!positions)
-					positions = 0111; /* default is a */
+					/* default is a */
+					positions = 0111;
 				if (!vstrchr("=+-", op = *cp))
 					break;
 				cp++;
@@ -1933,16 +1713,16 @@ c_dot(const char **wp)
 		bi_errorf("missing argument");
 		return (1);
 	}
-	if ((file = search(cp, path, R_OK, &errcode)) == NULL) {
-		bi_errorf("%s: %s", cp,
-		    errcode ? strerror(errcode) : "not found");
+	if ((file = search_path(cp, path, R_OK, &errcode)) == NULL) {
+		bi_errorf("%s: %s", cp, strerror(errcode));
 		return (1);
 	}
 
 	/* Set positional parameters? */
 	if (wp[builtin_opt.optind + 1]) {
 		argv = wp + builtin_opt.optind;
-		argv[0] = e->loc->argv[0]; /* preserve $0 */
+		/* preserve $0 */
+		argv[0] = e->loc->argv[0];
 		for (argc = 0; argv[argc + 1]; argc++)
 			;
 	} else {
@@ -1973,7 +1753,8 @@ c_wait(const char **wp)
 		for (; *wp; wp++)
 			rv = waitfor(*wp, &sig);
 		if (rv < 0)
-			rv = sig ? sig : 127; /* magic exit code: bad job-id */
+			/* magic exit code: bad job-id */
+			rv = sig ? sig : 127;
 	}
 	return (rv);
 }
@@ -1981,175 +1762,399 @@ c_wait(const char **wp)
 int
 c_read(const char **wp)
 {
-	int c = 0, ecode = 0, fd = 0, optc;
-	bool expande = true, historyr = false, expanding;
-	const char *cp, *emsg;
-	struct shf *shf;
-	XString cs, xs = { NULL, NULL, 0, NULL};
-	struct tbl *vp;
-	char *ccp, *xp = NULL, *wpalloc = NULL;
+#define is_ifsws(c) (ctype((c), C_IFS) && ctype((c), C_IFSWS))
 	static char REPLY[] = "REPLY";
+	int c, fd = 0, rv = 0, lastparm = 0;
+	bool savehist = false, intoarray = false, aschars = false;
+	bool rawmode = false, expanding = false;
+	enum { LINES, BYTES, UPTO, READALL } readmode = LINES;
+	char delim = '\n';
+	size_t bytesleft = 128, bytesread;
+	struct tbl *vp /* FU gcc */ = NULL, *vq;
+	char *cp, *allocd = NULL, *xp;
+	const char *ccp;
+	XString xs;
+	ptrdiff_t xsave = 0;
+	struct termios tios;
+	bool restore_tios = false;
+#if HAVE_SELECT
+	bool hastimeout = false;
+	struct timeval tv, tvlim;
+#define c_read_opts "Aad:N:n:prst:u,"
+#else
+#define c_read_opts "Aad:N:n:prsu,"
+#endif
 
-	while ((optc = ksh_getopt(wp, &builtin_opt, "prsu,")) != -1)
-		switch (optc) {
-		case 'p':
-			if ((fd = coproc_getfd(R_OK, &emsg)) < 0) {
-				bi_errorf("-p: %s", emsg);
-				return (1);
-			}
-			break;
-		case 'r':
-			expande = false;
-			break;
-		case 's':
-			historyr = true;
-			break;
-		case 'u':
-			if (!*(cp = builtin_opt.optarg))
-				fd = 0;
-			else if ((fd = check_fd(cp, R_OK, &emsg)) < 0) {
-				bi_errorf("-u: %s: %s", cp, emsg);
-				return (1);
-			}
-			break;
-		case '?':
-			return (1);
+	while ((c = ksh_getopt(wp, &builtin_opt, c_read_opts)) != -1)
+	switch (c) {
+	case 'a':
+		aschars = true;
+		/* FALLTHROUGH */
+	case 'A':
+		intoarray = true;
+		break;
+	case 'd':
+		delim = builtin_opt.optarg[0];
+		break;
+	case 'N':
+	case 'n':
+		readmode = c == 'N' ? BYTES : UPTO;
+		if (!bi_getn(builtin_opt.optarg, &c))
+			return (2);
+		if (c == -1) {
+			readmode = READALL;
+			bytesleft = 1024;
+		} else
+			bytesleft = (unsigned int)c;
+		break;
+	case 'p':
+		if ((fd = coproc_getfd(R_OK, &ccp)) < 0) {
+			bi_errorf("%s: %s", "-p", ccp);
+			return (2);
 		}
+		break;
+	case 'r':
+		rawmode = true;
+		break;
+	case 's':
+		savehist = true;
+		break;
+#if HAVE_SELECT
+	case 't':
+		if (parse_usec(builtin_opt.optarg, &tv)) {
+			bi_errorf("%s: %s '%s'", Tsynerr, strerror(errno),
+			    builtin_opt.optarg);
+			return (2);
+		}
+		hastimeout = true;
+		break;
+#endif
+	case 'u':
+		if (!builtin_opt.optarg[0])
+			fd = 0;
+		else if ((fd = check_fd(builtin_opt.optarg, R_OK, &ccp)) < 0) {
+			bi_errorf("%s: %s: %s", "-u", builtin_opt.optarg, ccp);
+			return (2);
+		}
+		break;
+	case '?':
+		return (2);
+	}
 	wp += builtin_opt.optind;
-
 	if (*wp == NULL)
 		*--wp = REPLY;
 
-	/* Since we can't necessarily seek backwards on non-regular files,
-	 * don't buffer them so we can't read too much.
-	 */
-	shf = shf_reopen(fd, SHF_RD | SHF_INTERRUPT | can_seek(fd), shl_spare);
+	if (intoarray && wp[1] != NULL) {
+		bi_errorf("too many arguments");
+		return (2);
+	}
 
-	if ((cp = cstrchr(*wp, '?')) != NULL) {
-		strdupx(wpalloc, *wp, ATEMP);
-		wpalloc[cp - *wp] = '\0';
-		*wp = wpalloc;
+	if ((ccp = cstrchr(*wp, '?')) != NULL) {
+		strdupx(allocd, *wp, ATEMP);
+		allocd[ccp - *wp] = '\0';
+		*wp = allocd;
 		if (isatty(fd)) {
-			/* AT&T ksh says it prints prompt on fd if it's open
+			/*
+			 * AT&T ksh says it prints prompt on fd if it's open
 			 * for writing and is a tty, but it doesn't do it
 			 * (it also doesn't check the interactive flag,
-			 * as is indicated in the Kornshell book).
+			 * as is indicated in the Korn Shell book).
 			 */
-			shellf("%s", cp+1);
+			shf_puts(ccp + 1, shl_out);
+			shf_flush(shl_out);
 		}
 	}
 
-	/* If we are reading from the co-process for the first time,
-	 * make sure the other side of the pipe is closed first. This allows
-	 * the detection of eof.
-	 *
-	 * This is not compatible with AT&T ksh... the fd is kept so another
-	 * coproc can be started with same output, however, this means eof
-	 * can't be detected... This is why it is closed here.
-	 * If this call is removed, remove the eof check below, too.
-	 * coproc_readw_close(fd);
+	Xinit(xs, xp, bytesleft, ATEMP);
+
+	if (readmode == LINES)
+		bytesleft = 1;
+	else if (isatty(fd)) {
+		x_mkraw(fd, &tios, true);
+		restore_tios = true;
+	}
+
+#if HAVE_SELECT
+	if (hastimeout) {
+		gettimeofday(&tvlim, NULL);
+		timeradd(&tvlim, &tv, &tvlim);
+	}
+#endif
+
+ c_read_readloop:
+#if HAVE_SELECT
+	if (hastimeout) {
+		fd_set fdset;
+
+		FD_ZERO(&fdset);
+		FD_SET(fd, &fdset);
+		gettimeofday(&tv, NULL);
+		timersub(&tvlim, &tv, &tv);
+		if (tv.tv_sec < 0) {
+			/* timeout expired globally */
+			rv = 1;
+			goto c_read_out;
+		}
+
+		switch (select(fd + 1, &fdset, NULL, NULL, &tv)) {
+		case 1:
+			break;
+		case 0:
+			/* timeout expired for this call */
+			rv = 1;
+			goto c_read_out;
+		default:
+			bi_errorf("%s: %s", Tselect, strerror(errno));
+			rv = 2;
+			goto c_read_out;
+		}
+	}
+#endif
+
+	bytesread = blocking_read(fd, xp, bytesleft);
+	if (bytesread == (size_t)-1) {
+		/* interrupted */
+		if (errno == EINTR && fatal_trap_check()) {
+			/*
+			 * Was the offending signal one that would
+			 * normally kill a process? If so, pretend
+			 * the read was killed.
+			 */
+			rv = 2;
+			goto c_read_out;
+		}
+		/* just ignore the signal */
+		goto c_read_readloop;
+	}
+
+	switch (readmode) {
+	case READALL:
+		if (bytesread == 0) {
+			/* end of file reached */
+			rv = 1;
+			goto c_read_readdone;
+		}
+		xp += bytesread;
+		XcheckN(xs, xp, bytesleft);
+		break;
+
+	case UPTO:
+		if (bytesread == 0)
+			/* end of file reached */
+			rv = 1;
+		xp += bytesread;
+		goto c_read_readdone;
+
+	case BYTES:
+		if (bytesread == 0) {
+			/* end of file reached */
+			rv = 1;
+			xp = Xstring(xs, xp);
+			goto c_read_readdone;
+		}
+		xp += bytesread;
+		if ((bytesleft -= bytesread) == 0)
+			goto c_read_readdone;
+		break;
+	case LINES:
+		if (bytesread == 0) {
+			/* end of file reached */
+			rv = 1;
+			goto c_read_readdone;
+		}
+		if ((c = *xp) == '\0' && !aschars && delim != '\0') {
+			/* skip any read NULs unless delimiter */
+			break;
+		}
+		if (expanding) {
+			expanding = false;
+			if (c == delim) {
+				if (Flag(FTALKING_I) && isatty(fd)) {
+					/*
+					 * set prompt in case this is
+					 * called from .profile or $ENV
+					 */
+					set_prompt(PS2, NULL);
+					pprompt(prompt, 0);
+				}
+				/* drop the backslash */
+				--xp;
+				/* and the delimiter */
+				break;
+			}
+		} else if (c == delim) {
+			goto c_read_readdone;
+		} else if (!rawmode && c == '\\') {
+			expanding = true;
+		}
+		Xcheck(xs, xp);
+		++xp;
+		break;
+	}
+	goto c_read_readloop;
+
+ c_read_readdone:
+	bytesread = Xlength(xs, xp);
+	Xput(xs, xp, '\0');
+
+	/*-
+	 * state: we finished reading the input and NUL terminated it
+	 * Xstring(xs, xp) -> xp-1 = input string without trailing delim
+	 * rv = 1 if EOF, 0 otherwise (errors handled already)
 	 */
 
-	if (historyr)
-		Xinit(xs, xp, 128, ATEMP);
-	expanding = false;
-	Xinit(cs, ccp, 128, ATEMP);
-	for (; *wp != NULL; wp++) {
-		for (ccp = Xstring(cs, ccp); ; ) {
-			if (c == '\n' || c == EOF)
-				break;
-			while (1) {
-				c = shf_getc(shf);
-				if (c == '\0')
-					continue;
-				if (c == EOF && shf_error(shf) &&
-				    shf_errno(shf) == EINTR) {
-					/* Was the offending signal one that
-					 * would normally kill a process?
-					 * If so, pretend the read was killed.
-					 */
-					ecode = fatal_trap_check();
+	if (rv == 1) {
+		/* clean up coprocess if needed, on EOF */
+		coproc_read_close(fd);
+		if (readmode == READALL)
+			/* EOF is no error here */
+			rv = 0;
+	}
 
-					/* non fatal (eg, CHLD), carry on */
-					if (!ecode) {
-						shf_clearerr(shf);
-						continue;
-					}
-				}
-				break;
-			}
-			if (historyr) {
-				Xcheck(xs, xp);
-				Xput(xs, xp, c);
-			}
-			Xcheck(cs, ccp);
-			if (expanding) {
-				expanding = false;
-				if (c == '\n') {
-					c = 0;
-					if (Flag(FTALKING_I) && isatty(fd)) {
-						/* set prompt in case this is
-						 * called from .profile or $ENV
-						 */
-						set_prompt(PS2, NULL);
-						pprompt(prompt, 0);
-					}
-				} else if (c != EOF)
-					Xput(cs, ccp, c);
-				continue;
-			}
-			if (expande && c == '\\') {
-				expanding = true;
-				continue;
-			}
-			if (c == '\n' || c == EOF)
-				break;
-			if (ctype(c, C_IFS)) {
-				if (Xlength(cs, ccp) == 0 && ctype(c, C_IFSWS))
-					continue;
-				if (wp[1])
-					break;
-			}
-			Xput(cs, ccp, c);
-		}
-		/* strip trailing IFS white space from last variable */
-		if (!wp[1])
-			while (Xlength(cs, ccp) && ctype(ccp[-1], C_IFS) &&
-			    ctype(ccp[-1], C_IFSWS))
-				ccp--;
-		Xput(cs, ccp, '\0');
+	if (savehist)
+		histsave(&source->line, Xstring(xs, xp), true, false);
+
+	ccp = cp = Xclose(xs, xp);
+	expanding = false;
+	XinitN(xs, 128, ATEMP);
+	if (intoarray) {
 		vp = global(*wp);
-		/* Must be done before setting export. */
 		if (vp->flag & RDONLY) {
-			shf_flush(shf);
-			bi_errorf("%s is read only", *wp);
-			afree(wpalloc, ATEMP);
-			return (1);
+ c_read_splitro:
+			bi_errorf("%s: %s", *wp, "is read only");
+ c_read_spliterr:
+			rv = 2;
+			afree(cp, ATEMP);
+			goto c_read_out;
 		}
+		/* exporting an array is currently pointless */
+		unset(vp, 1);
+		/* counter for array index */
+		c = 0;
+	}
+	if (!aschars) {
+		/* skip initial IFS whitespace */
+		while (bytesread && is_ifsws(*ccp)) {
+			++ccp;
+			--bytesread;
+		}
+		/* trim trailing IFS whitespace */
+		while (bytesread && is_ifsws(ccp[bytesread - 1])) {
+			--bytesread;
+		}
+	}
+ c_read_splitloop:
+	xp = Xstring(xs, xp);
+	/* generate next word */
+	if (!bytesread) {
+		/* no more input */
+		if (intoarray)
+			goto c_read_splitdone;
+		/* zero out next parameters */
+		goto c_read_gotword;
+	}
+	if (aschars) {
+		Xput(xs, xp, '1');
+		Xput(xs, xp, '#');
+		bytesleft = utf_ptradj(ccp);
+		while (bytesleft && bytesread) {
+			*xp++ = *ccp++;
+			--bytesleft;
+			--bytesread;
+		}
+		if (xp[-1] == '\0') {
+			xp[-1] = '0';
+			xp[-3] = '2';
+		}
+		goto c_read_gotword;
+	}
+
+	if (!intoarray && wp[1] == NULL)
+		lastparm = 1;
+
+ c_read_splitlast:
+	/* copy until IFS character */
+	while (bytesread) {
+		char ch;
+
+		ch = *ccp;
+		if (expanding) {
+			expanding = false;
+			goto c_read_splitcopy;
+		} else if (ctype(ch, C_IFS)) {
+			break;
+		} else if (!rawmode && ch == '\\') {
+			expanding = true;
+		} else {
+ c_read_splitcopy:
+			Xcheck(xs, xp);
+			Xput(xs, xp, ch);
+		}
+		++ccp;
+		--bytesread;
+	}
+	xsave = Xsavepos(xs, xp);
+	/* copy word delimiter: IFSWS+IFS,IFSWS */
+	while (bytesread) {
+		char ch;
+
+		ch = *ccp;
+		if (!ctype(ch, C_IFS))
+			break;
+		Xcheck(xs, xp);
+		Xput(xs, xp, ch);
+		++ccp;
+		--bytesread;
+		if (!ctype(ch, C_IFSWS))
+			break;
+	}
+	while (bytesread && is_ifsws(*ccp)) {
+		Xcheck(xs, xp);
+		Xput(xs, xp, *ccp);
+		++ccp;
+		--bytesread;
+	}
+	/* if no more parameters, rinse and repeat */
+	if (lastparm && bytesread) {
+		++lastparm;
+		goto c_read_splitlast;
+	}
+	/* get rid of the delimiter unless we pack the rest */
+	if (lastparm < 2)
+		xp = Xrestpos(xs, xp, xsave);
+ c_read_gotword:
+	Xput(xs, xp, '\0');
+	if (intoarray) {
+		vq = arraysearch(vp, c++);
+	} else {
+		vq = global(*wp);
+		/* must be checked before exporting */
+		if (vq->flag & RDONLY)
+			goto c_read_splitro;
 		if (Flag(FEXPORT))
 			typeset(*wp, EXPORT, 0, 0, 0);
-		if (!setstr(vp, Xstring(cs, ccp), KSH_RETURN_ERROR)) {
-			shf_flush(shf);
-			afree(wpalloc, ATEMP);
-			return (1);
-		}
 	}
-
-	shf_flush(shf);
-	if (historyr) {
-		Xput(xs, xp, '\0');
-		histsave(&source->line, Xstring(xs, xp), true, false);
-		Xfree(xs, xp);
+	if (!setstr(vq, Xstring(xs, xp), KSH_RETURN_ERROR))
+		goto c_read_spliterr;
+	if (aschars) {
+		setint_v(vq, vq, false);
+		/* protect from UTFMODE changes */
+		vq->type = 0;
 	}
-	/* if this is the co-process fd, close the file descriptor
-	 * (can get eof if and only if all processes are have died, ie,
-	 * coproc.njobs is 0 and the pipe is closed).
-	 */
-	if (c == EOF && !ecode)
-		coproc_read_close(fd);
+	if (intoarray || *++wp != NULL)
+		goto c_read_splitloop;
 
-	afree(wpalloc, ATEMP);
-	return (ecode ? ecode : c == EOF);
+ c_read_splitdone:
+	/* free up */
+	afree(cp, ATEMP);
+
+ c_read_out:
+	afree(allocd, ATEMP);
+	Xfree(xs, xp);
+	if (restore_tios)
+		tcsetattr(fd, TCSADRAIN, &tios);
+	return (rv);
+#undef is_ifsws
 }
 
 int
@@ -2231,20 +2236,21 @@ c_trap(const char **wp)
 	 * command 'exit' isn't confused with the pseudo-signal
 	 * 'EXIT'.
 	 */
-	s = (gettrap(*wp, false) == NULL) ? *wp++ : NULL; /* get command */
+	/* get command */
+	s = (gettrap(*wp, false) == NULL) ? *wp++ : NULL;
 	if (s != NULL && s[0] == '-' && s[1] == '\0')
 		s = NULL;
 
 	/* set/clear traps */
-	while (*wp != NULL) {
-		p = gettrap(*wp++, true);
-		if (p == NULL) {
-			bi_errorf("bad signal %s", wp[-1]);
-			return (1);
-		}
-		settrap(p, s);
-	}
-	return (0);
+	i = 0;
+	while (*wp != NULL)
+		if ((p = gettrap(*wp++, true)) == NULL) {
+			warningf(true, "%s: %s '%s'", builtin_argv0,
+			    "bad signal", wp[-1]);
+			++i;
+		} else
+			settrap(p, s);
+	return (i);
 }
 
 int
@@ -2260,14 +2266,17 @@ c_exitreturn(const char **wp)
 	if (arg) {
 		if (!getn(arg, &n)) {
 			exstat = 1;
-			warningf(true, "%s: bad number", arg);
+			warningf(true, "%s: %s", arg, "bad number");
 		} else
 			exstat = n;
-	}
-	if (wp[0][0] == 'r') { /* return */
+	} else if (trap_exstat != -1)
+		exstat = trap_exstat;
+	if (wp[0][0] == 'r') {
+		/* return */
 		struct env *ep;
 
-		/* need to tell if this is exit or return so trap exit will
+		/*
+		 * need to tell if this is exit or return so trap exit will
 		 * work right (POSIX)
 		 */
 		for (ep = e; ep; ep = ep->oenv)
@@ -2282,7 +2291,8 @@ c_exitreturn(const char **wp)
 		how = LSHELL;
 	}
 
-	quitenv(NULL);	/* get rid of any i/o redirections */
+	/* get rid of any i/o redirections */
+	quitenv(NULL);
 	unwind(how);
 	/* NOTREACHED */
 }
@@ -2305,7 +2315,7 @@ c_brkcont(const char **wp)
 	quit = n;
 	if (quit <= 0) {
 		/* AT&T ksh does this for non-interactive shells only - weird */
-		bi_errorf("%s: bad value", arg);
+		bi_errorf("%s: %s", arg, "bad value");
 		return (1);
 	}
 
@@ -2319,15 +2329,17 @@ c_brkcont(const char **wp)
 		}
 
 	if (quit) {
-		/* AT&T ksh doesn't print a message - just does what it
+		/*
+		 * AT&T ksh doesn't print a message - just does what it
 		 * can. We print a message 'cause it helps in debugging
 		 * scripts, but don't generate an error (ie, keep going).
 		 */
 		if (n == quit) {
-			warningf(true, "%s: cannot %s", wp[0], wp[0]);
+			warningf(true, "%s: %s %s", wp[0], "can't", wp[0]);
 			return (0);
 		}
-		/* POSIX says if n is too big, the last enclosing loop
+		/*
+		 * POSIX says if n is too big, the last enclosing loop
 		 * shall be used. Doesn't say to print an error but we
 		 * do anyway 'cause the user messed up.
 		 */
@@ -2350,7 +2362,7 @@ c_set(const char **wp)
 	const char **owp;
 
 	if (wp[1] == NULL) {
-		static const char *args[] = { "set", "-", NULL };
+		static const char *args[] = { Tset, "-", NULL };
 		return (c_typeset(args));
 	}
 
@@ -2361,11 +2373,12 @@ c_set(const char **wp)
 	if (setargs) {
 		wp += argi - 1;
 		owp = wp;
-		wp[0] = l->argv[0]; /* save $0 */
+		/* save $0 */
+		wp[0] = l->argv[0];
 		while (*++wp != NULL)
 			strdupx(*wp, *wp, &l->area);
 		l->argc = wp - owp - 1;
-		l->argv = alloc((l->argc + 2) * sizeof(char *), &l->area);
+		l->argv = alloc2(l->argc + 2, sizeof(char *), &l->area);
 		for (wp = l->argv; (*wp++ = *owp++) != NULL; )
 			;
 	}
@@ -2385,7 +2398,7 @@ int
 c_unset(const char **wp)
 {
 	const char *id;
-	int optc;
+	int optc, rv = 0;
 	bool unset_var = true;
 
 	while ((optc = ksh_getopt(wp, &builtin_opt, "fv")) != -1)
@@ -2397,11 +2410,13 @@ c_unset(const char **wp)
 			unset_var = true;
 			break;
 		case '?':
-			return (1);
+			/*XXX not reached due to GF_ERROR */
+			return (2);
 		}
 	wp += builtin_opt.optind;
 	for (; (id = *wp) != NULL; wp++)
-		if (unset_var) {	/* unset variable */
+		if (unset_var) {
+			/* unset variable */
 			struct tbl *vp;
 			char *cp = NULL;
 			size_t n;
@@ -2419,13 +2434,15 @@ c_unset(const char **wp)
 			afree(cp, ATEMP);
 
 			if ((vp->flag&RDONLY)) {
-				bi_errorf("%s is read only", vp->name);
-				return (1);
-			}
-			unset(vp, optc);
-		} else			/* unset function */
+				warningf(true, "%s: %s", vp->name,
+				    "is read only");
+				rv = 1;
+			} else
+				unset(vp, optc);
+		} else
+			/* unset function */
 			define(id, NULL);
-	return (0);
+	return (rv);
 }
 
 static void
@@ -2497,7 +2514,8 @@ timex(struct op *t, int f, volatile int *xerrok)
 	} else
 		tf = TF_NOARGS;
 
-	if (tf & TF_NOARGS) { /* ksh93 - report shell times (shell+kids) */
+	if (tf & TF_NOARGS) {
+		/* ksh93 - report shell times (shell+kids) */
 		tf |= TF_NOREAL;
 		timeradd(&ru0.ru_utime, &cru0.ru_utime, &usrtime);
 		timeradd(&ru0.ru_stime, &cru0.ru_stime, &systime);
@@ -2542,17 +2560,19 @@ timex_hook(struct op *t, char **volatile *app)
 	Getopt opt;
 
 	ksh_getopt_reset(&opt, 0);
-	opt.optind = 0;	/* start at the start */
+	/* start at the start */
+	opt.optind = 0;
 	while ((optc = ksh_getopt((const char **)wp, &opt, ":p")) != -1)
 		switch (optc) {
 		case 'p':
 			t->str[0] |= TF_POSIX;
 			break;
 		case '?':
-			errorf("time: -%s unknown option", opt.optarg);
+			errorf("time: -%s %s", opt.optarg,
+			    "unknown option");
 		case ':':
-			errorf("time: -%s requires an argument",
-			    opt.optarg);
+			errorf("time: -%s %s", opt.optarg,
+			    "requires an argument");
 		}
 	/* Copy command words down over options. */
 	if (opt.optind != 0) {
@@ -2609,7 +2629,7 @@ c_mknod(const char **wp)
 				return (1);
 			}
 			mode = getmode(set, (mode_t)(DEFFILEMODE));
-			free(set);
+			free_ossetmode(set);
 			break;
 		default:
 			goto c_mknod_usage;
@@ -2640,28 +2660,28 @@ c_mknod(const char **wp)
 
 		majnum = strtoul(argv[2], &c, 0);
 		if ((c == argv[2]) || (*c != '\0')) {
-			bi_errorf("non-numeric device major '%s'", argv[2]);
+			bi_errorf("non-numeric %s %s '%s'", "device", "major", argv[2]);
 			goto c_mknod_err;
 		}
 		minnum = strtoul(argv[3], &c, 0);
 		if ((c == argv[3]) || (*c != '\0')) {
-			bi_errorf("non-numeric device minor '%s'", argv[3]);
+			bi_errorf("non-numeric %s %s '%s'", "device", "minor", argv[3]);
 			goto c_mknod_err;
 		}
 		dv = makedev(majnum, minnum);
 		if ((unsigned long)(major(dv)) != majnum) {
-			bi_errorf("device major too large: %lu", majnum);
+			bi_errorf("%s %s too large: %lu", "device", "major", majnum);
 			goto c_mknod_err;
 		}
 		if ((unsigned long)(minor(dv)) != minnum) {
-			bi_errorf("device minor too large: %lu", minnum);
+			bi_errorf("%s %s too large: %lu", "device", "minor", minnum);
 			goto c_mknod_err;
 		}
 		if (mknod(argv[0], mode, dv))
 			goto c_mknod_failed;
 	} else if (mkfifo(argv[0], mode)) {
  c_mknod_failed:
-		bi_errorf("%s: %s", *wp, strerror(errno));
+		bi_errorf("%s: %s", argv[0], strerror(errno));
  c_mknod_err:
 		rv = 1;
 	}
@@ -2670,20 +2690,14 @@ c_mknod(const char **wp)
 		umask(oldmode);
 	return (rv);
  c_mknod_usage:
-	bi_errorf("usage: mknod [-m mode] name b|c major minor");
-	bi_errorf("usage: mknod [-m mode] name p");
+	bi_errorf("%s: %s", "usage", "mknod [-m mode] name b|c major minor");
+	bi_errorf("%s: %s", "usage", "mknod [-m mode] name p");
 	return (1);
 }
 #endif
 
-/* dummy function, special case in comexec() */
-int
-c_builtin(const char **wp MKSH_A_UNUSED)
-{
-	return (0);
-}
-
-/* test(1) accepts the following grammar:
+/*-
+   test(1) accepts the following grammar:
 	oexpr	::= aexpr | aexpr "-o" oexpr ;
 	aexpr	::= nexpr | nexpr "-a" aexpr ;
 	nexpr	::= primary | "!" nexpr ;
@@ -2704,7 +2718,8 @@ c_builtin(const char **wp MKSH_A_UNUSED)
 	operand ::= <any thing>
 */
 
-#define T_ERR_EXIT	2	/* POSIX says > 1 for errors */
+/* POSIX says > 1 for errors */
+#define T_ERR_EXIT	2
 
 int
 c_test(const char **wp)
@@ -2737,10 +2752,22 @@ c_test(const char **wp)
 	 * our parser does the right thing for the omitted steps.
 	 */
 	if (argc <= 5) {
-		const char **owp = wp;
+		const char **owp = wp, **owpend = te.wp_end;
 		int invert = 0;
 		Test_op op;
 		const char *opnd1, *opnd2;
+
+		if (argc >= 2 && ((*te.isa)(&te, TM_OPAREN))) {
+			te.pos.wp = te.wp_end - 1;
+			if ((*te.isa)(&te, TM_CPAREN)) {
+				argc -= 2;
+				te.wp_end--;
+				te.pos.wp = owp + 2;
+			} else {
+				te.pos.wp = owp + 1;
+				te.wp_end = owpend;
+			}
+		}
 
 		while (--argc >= 0) {
 			if ((*te.isa)(&te, TM_END))
@@ -2762,8 +2789,6 @@ c_test(const char **wp)
 			}
 			if (argc == 1) {
 				opnd1 = (*te.getopnd)(&te, TO_NONOP, 1);
-				if (strcmp(opnd1, "-t") == 0)
-				    break;
 				res = (*te.eval)(&te, TO_STNZE, opnd1,
 				    NULL, 1);
 				if (invert & 1)
@@ -2776,6 +2801,7 @@ c_test(const char **wp)
 				break;
 		}
 		te.pos.wp = owp + 1;
+		te.wp_end = owpend;
 	}
 
 	return (test_parse(&te));
@@ -2813,99 +2839,184 @@ test_eval(Test_env *te, Test_op op, const char *opnd1, const char *opnd2,
 	if (!do_eval)
 		return (0);
 
-	switch ((int)op) {
+	switch (op) {
+
 	/*
 	 * Unary Operators
 	 */
-	case TO_STNZE: /* -n */
+
+	/* -n */
+	case TO_STNZE:
 		return (*opnd1 != '\0');
-	case TO_STZER: /* -z */
+
+	/* -z */
+	case TO_STZER:
 		return (*opnd1 == '\0');
-	case TO_OPTION: /* -o */
+
+	/* -o */
+	case TO_OPTION:
 		if ((i = *opnd1) == '!' || i == '?')
 			opnd1++;
 		if ((k = option(opnd1)) == (size_t)-1)
 			return (0);
 		return (i == '?' ? 1 : i == '!' ? !Flag(k) : Flag(k));
-	case TO_FILRD: /* -r */
-		return (test_eaccess(opnd1, R_OK) == 0);
-	case TO_FILWR: /* -w */
-		return (test_eaccess(opnd1, W_OK) == 0);
-	case TO_FILEX: /* -x */
-		return (test_eaccess(opnd1, X_OK) == 0);
-	case TO_FILAXST: /* -a */
-	case TO_FILEXST: /* -e */
+
+	/* -r */
+	case TO_FILRD:
+		/* LINTED use of access */
+		return (access(opnd1, R_OK) == 0);
+
+	/* -w */
+	case TO_FILWR:
+		/* LINTED use of access */
+		return (access(opnd1, W_OK) == 0);
+
+	/* -x */
+	case TO_FILEX:
+		return (ksh_access(opnd1, X_OK) == 0);
+
+	/* -a */
+	case TO_FILAXST:
+	/* -e */
+	case TO_FILEXST:
 		return (stat(opnd1, &b1) == 0);
-	case TO_FILREG: /* -r */
+
+	/* -r */
+	case TO_FILREG:
 		return (stat(opnd1, &b1) == 0 && S_ISREG(b1.st_mode));
-	case TO_FILID: /* -d */
+
+	/* -d */
+	case TO_FILID:
 		return (stat(opnd1, &b1) == 0 && S_ISDIR(b1.st_mode));
-	case TO_FILCDEV: /* -c */
+
+	/* -c */
+	case TO_FILCDEV:
 		return (stat(opnd1, &b1) == 0 && S_ISCHR(b1.st_mode));
-	case TO_FILBDEV: /* -b */
+
+	/* -b */
+	case TO_FILBDEV:
 		return (stat(opnd1, &b1) == 0 && S_ISBLK(b1.st_mode));
-	case TO_FILFIFO: /* -p */
+
+	/* -p */
+	case TO_FILFIFO:
 		return (stat(opnd1, &b1) == 0 && S_ISFIFO(b1.st_mode));
-	case TO_FILSYM: /* -h -L */
+
+	/* -h or -L */
+	case TO_FILSYM:
 		return (lstat(opnd1, &b1) == 0 && S_ISLNK(b1.st_mode));
-	case TO_FILSOCK: /* -S */
+
+	/* -S */
+	case TO_FILSOCK:
 		return (stat(opnd1, &b1) == 0 && S_ISSOCK(b1.st_mode));
-	case TO_FILCDF:/* -H HP context dependent files (directories) */
+
+	/* -H => HP context dependent files (directories) */
+	case TO_FILCDF:
+#ifdef S_ISCDF
+	{
+		char *nv;
+
+		/*
+		 * Append a + to filename and check to see if result is
+		 * a setuid directory. CDF stuff in general is hookey,
+		 * since it breaks for, e.g., the following sequence:
+		 * echo hi >foo+; mkdir foo; echo bye >foo/default;
+		 * chmod u+s foo (foo+ refers to the file with hi in it,
+		 * there is no way to get at the file with bye in it;
+		 * please correct me if I'm wrong about this).
+		 */
+
+		nv = shf_smprintf("%s+", opnd1);
+		i = (stat(nv, &b1) == 0 && S_ISCDF(b1.st_mode));
+		afree(nv, ATEMP);
+		return (i);
+	}
+#else
 		return (0);
-	case TO_FILSETU: /* -u */
+#endif
+
+	/* -u */
+	case TO_FILSETU:
 		return (stat(opnd1, &b1) == 0 &&
 		    (b1.st_mode & S_ISUID) == S_ISUID);
-	case TO_FILSETG: /* -g */
+
+	/* -g */
+	case TO_FILSETG:
 		return (stat(opnd1, &b1) == 0 &&
 		    (b1.st_mode & S_ISGID) == S_ISGID);
-	case TO_FILSTCK: /* -k */
+
+	/* -k */
+	case TO_FILSTCK:
 #ifdef S_ISVTX
 		return (stat(opnd1, &b1) == 0 &&
 		    (b1.st_mode & S_ISVTX) == S_ISVTX);
 #else
 		return (0);
 #endif
-	case TO_FILGZ: /* -s */
+
+	/* -s */
+	case TO_FILGZ:
 		return (stat(opnd1, &b1) == 0 && b1.st_size > 0L);
-	case TO_FILTT: /* -t */
+
+	/* -t */
+	case TO_FILTT:
 		if (opnd1 && !bi_getn(opnd1, &i)) {
 			te->flags |= TEF_ERROR;
 			i = 0;
 		} else
 			i = isatty(opnd1 ? i : 0);
 		return (i);
-	case TO_FILUID: /* -O */
+
+	/* -O */
+	case TO_FILUID:
 		return (stat(opnd1, &b1) == 0 && b1.st_uid == ksheuid);
-	case TO_FILGID: /* -G */
+
+	/* -G */
+	case TO_FILGID:
 		return (stat(opnd1, &b1) == 0 && b1.st_gid == getegid());
+
 	/*
 	 * Binary Operators
 	 */
-	case TO_STEQL: /* = */
+
+	/* = */
+	case TO_STEQL:
 		if (te->flags & TEF_DBRACKET)
 			return (gmatchx(opnd1, opnd2, false));
 		return (strcmp(opnd1, opnd2) == 0);
-	case TO_STNEQ: /* != */
+
+	/* != */
+	case TO_STNEQ:
 		if (te->flags & TEF_DBRACKET)
 			return (!gmatchx(opnd1, opnd2, false));
 		return (strcmp(opnd1, opnd2) != 0);
-	case TO_STLT: /* < */
+
+	/* < */
+	case TO_STLT:
 		return (strcmp(opnd1, opnd2) < 0);
-	case TO_STGT: /* > */
+
+	/* > */
+	case TO_STGT:
 		return (strcmp(opnd1, opnd2) > 0);
-	case TO_INTEQ: /* -eq */
-	case TO_INTNE: /* -ne */
-	case TO_INTGE: /* -ge */
-	case TO_INTGT: /* -gt */
-	case TO_INTLE: /* -le */
-	case TO_INTLT: /* -lt */
+
+	/* -eq */
+	case TO_INTEQ:
+	/* -ne */
+	case TO_INTNE:
+	/* -ge */
+	case TO_INTGE:
+	/* -gt */
+	case TO_INTGT:
+	/* -le */
+	case TO_INTLE:
+	/* -lt */
+	case TO_INTLT:
 		if (!evaluate(opnd1, &v1, KSH_RETURN_ERROR, false) ||
 		    !evaluate(opnd2, &v2, KSH_RETURN_ERROR, false)) {
 			/* error already printed.. */
 			te->flags |= TEF_ERROR;
 			return (1);
 		}
-		switch ((int)op) {
+		switch (op) {
 		case TO_INTEQ:
 			return (v1 == v2);
 		case TO_INTNE:
@@ -2918,47 +3029,45 @@ test_eval(Test_env *te, Test_op op, const char *opnd1, const char *opnd2,
 			return (v1 <= v2);
 		case TO_INTLT:
 			return (v1 < v2);
+		default:
+			/* NOTREACHED */
+			break;
 		}
-	case TO_FILNT: /* -nt */
-		/* ksh88/ksh93 succeed if file2 can't be stated
+		/* NOTREACHED */
+
+	/* -nt */
+	case TO_FILNT:
+		/*
+		 * ksh88/ksh93 succeed if file2 can't be stated
 		 * (subtly different from 'does not exist').
 		 */
 		return (stat(opnd1, &b1) == 0 &&
 		    (((s = stat(opnd2, &b2)) == 0 &&
 		    b1.st_mtime > b2.st_mtime) || s < 0));
-	case TO_FILOT: /* -ot */
-		/* ksh88/ksh93 succeed if file1 can't be stated
+
+	/* -ot */
+	case TO_FILOT:
+		/*
+		 * ksh88/ksh93 succeed if file1 can't be stated
 		 * (subtly different from 'does not exist').
 		 */
 		return (stat(opnd2, &b2) == 0 &&
 		    (((s = stat(opnd1, &b1)) == 0 &&
 		    b1.st_mtime < b2.st_mtime) || s < 0));
-	case TO_FILEQ: /* -ef */
+
+	/* -ef */
+	case TO_FILEQ:
 		return (stat (opnd1, &b1) == 0 && stat (opnd2, &b2) == 0 &&
 		    b1.st_dev == b2.st_dev && b1.st_ino == b2.st_ino);
+
+	/* all other cases */
+	case TO_NONOP:
+	case TO_NONNULL:
+		/* throw the error */
+		break;
 	}
 	(*te->error)(te, 0, "internal error: unknown op");
 	return (1);
-}
-
-/* On most/all unixen, access() says everything is executable for root... */
-static int
-test_eaccess(const char *pathl, int mode)
-{
-	int rv;
-
-	if ((rv = access(pathl, mode)) == 0 && ksheuid == 0 && (mode & X_OK)) {
-		struct stat statb;
-
-		if (stat(pathl, &statb) < 0)
-			rv = -1;
-		else if (S_ISDIR(statb.st_mode))
-			rv = 0;
-		else
-			rv = (statb.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH)) ?
-			    0 : -1;
-	}
-	return (rv);
 }
 
 int
@@ -3020,7 +3129,7 @@ test_primary(Test_env *te, bool do_eval)
 		if (te->flags & TEF_ERROR)
 			return (0);
 		if (!(*te->isa)(te, TM_CPAREN)) {
-			(*te->error)(te, 0, "missing closing paren");
+			(*te->error)(te, 0, "missing )");
 			return (0);
 		}
 		return (rv);
@@ -3280,7 +3389,8 @@ c_ulimit(const char **wp)
 			all = true;
 			break;
 		case '?':
-			bi_errorf("usage: ulimit [-acdfHLlmnpSsTtvw] [value]");
+			bi_errorf("%s: %s", "usage",
+			    "ulimit [-acdfHLlmnpSsTtvw] [value]");
 			return (1);
 		default:
 			what = optc;
@@ -3336,7 +3446,7 @@ set_ulimit(const struct limits *l, const char *v, int how)
 	}
 
 	if (getrlimit(l->resource, &limit) < 0) {
-		/* some cannot be read, e.g. Linux RLIMIT_LOCKS */
+		/* some can't be read, e.g. Linux RLIMIT_LOCKS */
 		limit.rlim_cur = RLIM_INFINITY;
 		limit.rlim_max = RLIM_INFINITY;
 	}
@@ -3379,15 +3489,20 @@ c_rename(const char **wp)
 {
 	int rv = 1;
 
-	if (wp == NULL		/* argv */ ||
-	    wp[0] == NULL	/* name of builtin */ ||
-	    wp[1] == NULL	/* first argument */ ||
-	    wp[2] == NULL	/* second argument */ ||
-	    wp[3] != NULL	/* no further args please */)
-		bi_errorf(T_synerr);
-	else if ((rv = rename(wp[1], wp[2])) != 0) {
+	/* skip argv[0] */
+	++wp;
+	if (wp[0] && !strcmp(wp[0], "--"))
+		/* skip "--" (options separator) */
+		++wp;
+
+	/* check for exactly two arguments */
+	if (wp[0] == NULL	/* first argument */ ||
+	    wp[1] == NULL	/* second argument */ ||
+	    wp[2] != NULL	/* no further args please */)
+		bi_errorf(Tsynerr);
+	else if ((rv = rename(wp[0], wp[1])) != 0) {
 		rv = errno;
-		bi_errorf("failed: %s", strerror(rv));
+		bi_errorf("%s: %s", "failed", strerror(rv));
 	}
 
 	return (rv);
@@ -3399,31 +3514,161 @@ c_realpath(const char **wp)
 	int rv = 1;
 	char *buf;
 
-	if (wp != NULL && wp[0] != NULL && wp[1] != NULL) {
-		if (strcmp(wp[1], "--")) {
-			if (wp[2] == NULL) {
-				wp += 1;
-				rv = 0;
-			}
-		} else {
-			if (wp[2] != NULL && wp[3] == NULL) {
-				wp += 2;
-				rv = 0;
-			}
-		}
-	}
+	/* skip argv[0] */
+	++wp;
+	if (wp[0] && !strcmp(wp[0], "--"))
+		/* skip "--" (options separator) */
+		++wp;
 
-	if (rv)
-		bi_errorf(T_synerr);
-	else if ((buf = do_realpath(*wp)) == NULL) {
+	/* check for exactly one argument */
+	if (wp[0] == NULL || wp[1] != NULL)
+		bi_errorf(Tsynerr);
+	else if ((buf = do_realpath(wp[0])) == NULL) {
 		rv = errno;
-		bi_errorf("%s: %s", *wp, strerror(rv));
+		bi_errorf("%s: %s", wp[0], strerror(rv));
 		if ((unsigned int)rv > 255)
 			rv = 255;
 	} else {
 		shprintf("%s\n", buf);
 		afree(buf, ATEMP);
+		rv = 0;
 	}
 
 	return (rv);
 }
+
+int
+c_cat(const char **wp)
+{
+	int fd = STDIN_FILENO, rv;
+	ssize_t n, w;
+	const char *fn = "<stdin>";
+	char *buf, *cp;
+#define MKSH_CAT_BUFSIZ 4096
+
+	if ((buf = malloc_osfunc(MKSH_CAT_BUFSIZ)) == NULL) {
+		bi_errorf(Toomem, (unsigned long)MKSH_CAT_BUFSIZ);
+		return (1);
+	}
+
+	/* parse options: POSIX demands we support "-u" as no-op */
+	while ((rv = ksh_getopt(wp, &builtin_opt, "u")) != -1) {
+		switch (rv) {
+		case 'u':
+			/* we already operate unbuffered */
+			break;
+		default:
+			bi_errorf(Tsynerr);
+			return (1);
+		}
+	}
+	wp += builtin_opt.optind;
+	rv = 0;
+
+	do {
+		if (*wp) {
+			fn = *wp++;
+			if (fn[0] == '-' && fn[1] == '\0')
+				fd = STDIN_FILENO;
+			else if ((fd = open(fn, O_RDONLY)) < 0) {
+				rv = errno;
+				bi_errorf("%s: %s", fn, strerror(rv));
+				rv = 1;
+				continue;
+			}
+		}
+		while (/* CONSTCOND */ 1) {
+			n = blocking_read(fd, (cp = buf), MKSH_CAT_BUFSIZ);
+			if (n == -1) {
+				if (errno == EINTR) {
+					/* give the user a chance to ^C out */
+					intrcheck();
+					/* interrupted, try again */
+					continue;
+				}
+				/* an error occured during reading */
+				rv = errno;
+				bi_errorf("%s: %s", fn, strerror(rv));
+				rv = 1;
+				break;
+			} else if (n == 0)
+				/* end of file reached */
+				break;
+			while (n) {
+				w = write(STDOUT_FILENO, cp, n);
+				if (w == -1) {
+					if (errno == EINTR)
+						/* interrupted, try again */
+						continue;
+					/* an error occured during writing */
+					rv = errno;
+					bi_errorf("%s: %s", "<stdout>",
+					    strerror(rv));
+					rv = 1;
+					if (fd != STDIN_FILENO)
+						close(fd);
+					goto out;
+				}
+				n -= w;
+				cp += w;
+			}
+		}
+		if (fd != STDIN_FILENO)
+			close(fd);
+	} while (*wp);
+
+ out:
+	free_osfunc(buf);
+	return (rv);
+}
+
+#if HAVE_SELECT
+int
+c_sleep(const char **wp)
+{
+	struct timeval tv;
+	int rv = 1;
+
+	/* skip argv[0] */
+	++wp;
+	if (wp[0] && !strcmp(wp[0], "--"))
+		/* skip "--" (options separator) */
+		++wp;
+
+	if (!wp[0] || wp[1])
+		bi_errorf(Tsynerr);
+	else if (parse_usec(wp[0], &tv))
+		bi_errorf("%s: %s '%s'", Tsynerr, strerror(errno), wp[0]);
+	else {
+#ifndef MKSH_NOPROSPECTOFWORK
+		sigset_t omask;
+
+		/* block SIGCHLD from interrupting us, though */
+		sigprocmask(SIG_BLOCK, &sm_sigchld, &omask);
+#endif
+		if (select(0, NULL, NULL, NULL, &tv) == 0 || errno == EINTR)
+			/*
+			 * strictly speaking only for SIGALRM, but the
+			 * execution may be interrupted by other signals
+			 */
+			rv = 0;
+		else
+			bi_errorf("%s: %s", Tselect, strerror(errno));
+#ifndef MKSH_NOPROSPECTOFWORK
+		sigprocmask(SIG_SETMASK, &omask, NULL);
+#endif
+	}
+	return (rv);
+}
+#endif
+
+#if defined(ANDROID)
+static int
+c_android_lsmod(const char **wp MKSH_A_UNUSED)
+{
+	const char *cwp[3] = { "cat", "/proc/modules", NULL };
+
+	builtin_argv0 = cwp[0];
+	return (c_cat(cwp));
+}
+#endif
